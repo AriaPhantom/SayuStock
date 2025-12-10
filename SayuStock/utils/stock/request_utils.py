@@ -6,11 +6,11 @@ from typing import Dict, List, Tuple, Union, Optional
 import aiofiles
 from gsuid_core.logger import logger
 from PIL import Image, UnidentifiedImageError
-from aiohttp import ClientSession, ClientConnectorError
+from aiohttp import ClientError, ClientSession, ClientConnectorError
 
-from ..constant import PREFIX_DATA, code_id_dict
 from .utils import get_file, calculate_difference
 from ...stock_config.stock_config import STOCK_CONFIG
+from ..constant import PREFIX_DATA, code_id_dict, header_simple
 
 
 async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
@@ -24,7 +24,7 @@ async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
         'plat': 'Web',
         'FCODE': str(fcode),
     }
-    async with ClientSession() as sess:
+    async with ClientSession(headers=header_simple) as sess:
         try:
             async with sess.get(_api, params=params) as res:
                 if res.status == 200:
@@ -33,7 +33,7 @@ async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
                         f"[SayuStock]获取{params['FCODE']}持仓数据成功"
                     )
                     return data
-        except ClientConnectorError:
+        except ClientError:
             logger.warning(f"[SayuStock]获取{params['FCODE']}持仓数据失败")
     return None
 
@@ -44,7 +44,7 @@ async def get_hours_from_em() -> Tuple[float, float]:
     ya = 0
     for mk in ['1.000001', '0.399001']:
         url = URL + '&secid=' + mk
-        async with ClientSession() as sess:
+        async with ClientSession(headers=header_simple) as sess:
             try:
                 async with sess.get(url) as res:
                     if res.status == 200:
@@ -52,7 +52,7 @@ async def get_hours_from_em() -> Tuple[float, float]:
                         ya0, y0 = calculate_difference(data['data']['trends'])
                         y += y0
                         ya += ya0
-            except ClientConnectorError:
+            except ClientError:
                 logger.warning(f"[SayuStock]获取{mk}数据失败")
     return ya, y
 
@@ -103,60 +103,65 @@ async def get_code_id(
         ('token', 'D43BF722C8E33BDC906FB84D85E326E8'),
         ('count', '4'),
     )
-    async with ClientSession() as sess:
-        async with sess.get(url, params=params) as res:
-            if res.status == 200:
-                logger.debug(f"[SayuStock]开始获取{code}的ID")
-                text = await res.text()
-                logger.debug(text)
-                data = json.loads(text)
-                code_dict: List[Dict] = data['QuotationCodeTable']['Data']
-                if code_dict:
-                    # 排序：SecurityTypeName为"债券"的排到最后
-                    if not is_bond:
-                        code_dict.sort(
-                            key=lambda x: x.get('SecurityTypeName') == '债券'
-                        )
-                    for i in code_dict:
-                        if priority is None:
+    async with ClientSession(headers=header_simple) as sess:
+        try:
+            async with sess.get(url, params=params) as res:
+                if res.status == 200:
+                    logger.debug(f"[SayuStock]开始获取{code}的ID")
+                    text = await res.text()
+                    logger.debug(text)
+                    data = json.loads(text)
+                    code_dict: List[Dict] = data['QuotationCodeTable']['Data']
+                    if code_dict:
+                        # 排序：SecurityTypeName为"债券"的排到最后
+                        if not is_bond:
+                            code_dict.sort(
+                                key=lambda x: x.get('SecurityTypeName')
+                                == '债券'
+                            )
+                        for i in code_dict:
+                            if priority is None:
+                                return (
+                                    i['QuoteID'],
+                                    i['Name'],
+                                    i['SecurityTypeName'],
+                                )
+                            elif priority == 'h':
+                                if i['SecurityTypeName'] in ['港股']:
+                                    return (
+                                        i['QuoteID'],
+                                        i['Name'],
+                                        i['SecurityTypeName'],
+                                    )
+                            elif priority == 'us':
+                                if i['SecurityTypeName'] in ['美股', '粉单']:
+                                    return (
+                                        i['QuoteID'],
+                                        i['Name'],
+                                        i['SecurityTypeName'],
+                                    )
+                            elif priority == 'a':
+                                if i['SecurityTypeName'] in [
+                                    '沪深A',
+                                    '沪A',
+                                    '深A',
+                                ]:
+                                    return (
+                                        i['QuoteID'],
+                                        i['Name'],
+                                        i['SecurityTypeName'],
+                                    )
+                        else:
                             return (
-                                i['QuoteID'],
-                                i['Name'],
+                                code_dict[0]['QuoteID'],
+                                code_dict[0]['Name'],
                                 i['SecurityTypeName'],
                             )
-                        elif priority == 'h':
-                            if i['SecurityTypeName'] in ['港股']:
-                                return (
-                                    i['QuoteID'],
-                                    i['Name'],
-                                    i['SecurityTypeName'],
-                                )
-                        elif priority == 'us':
-                            if i['SecurityTypeName'] in ['美股', '粉单']:
-                                return (
-                                    i['QuoteID'],
-                                    i['Name'],
-                                    i['SecurityTypeName'],
-                                )
-                        elif priority == 'a':
-                            if i['SecurityTypeName'] in [
-                                '沪深A',
-                                '沪A',
-                                '深A',
-                            ]:
-                                return (
-                                    i['QuoteID'],
-                                    i['Name'],
-                                    i['SecurityTypeName'],
-                                )
                     else:
-                        return (
-                            code_dict[0]['QuoteID'],
-                            code_dict[0]['Name'],
-                            i['SecurityTypeName'],
-                        )
-                else:
-                    return None
+                        return None
+        except ClientError:
+            logger.warning(f"[SayuStock]获取{code}ID失败")
+            return None
     return None
 
 
@@ -186,7 +191,7 @@ async def get_image_from_em(
                     f"[SayuStock]{name}已存在文件读取失败, 尝试重新下载..."
                 )
 
-    async with ClientSession() as sess:
+    async with ClientSession(headers=header_simple) as sess:
         try:
             logger.info(f'[SayuStock]开始下载: {name} | 地址: {url}')
             async with sess.get(url) as res:
@@ -196,7 +201,7 @@ async def get_image_from_em(
                 else:
                     logger.warning(f"[SayuStock]{name}下载失败")
                     return Image.new('RGBA', (256, 256))
-        except ClientConnectorError:
+        except ClientError:
             logger.warning(f"[SayuStock]{name}下载失败")
             return Image.new('RGBA', (256, 256))
 
