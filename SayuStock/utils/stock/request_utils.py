@@ -1,37 +1,37 @@
 import json
 from io import BytesIO
-from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Union, Optional
+from datetime import datetime, timedelta
 
 import aiofiles
-from gsuid_core.logger import logger
 from PIL import Image, UnidentifiedImageError
 from aiohttp import ClientError, ClientSession, ClientConnectorError
 
+from gsuid_core.logger import logger
+
 from .utils import get_file, calculate_difference
+from ..constant import PREFIX_DATA, code_id_dict
 from ...stock_config.stock_config import STOCK_CONFIG
 from ..constant import PREFIX_DATA, code_id_dict, header_simple
 
 
 async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
-    _api = 'https://fundwebapi.eastmoney.com/FundMEApi/FundPositionList'
+    _api = "https://fundwebapi.eastmoney.com/FundMEApi/FundPositionList"
     params = {
-        'pageIndex': '1',
-        'pageSize': '10',
-        'deviceid': '1234567.py.service',
-        'version': '4.3.0',
-        'product': 'Eastmoney',
-        'plat': 'Web',
-        'FCODE': str(fcode),
+        "pageIndex": "1",
+        "pageSize": "10",
+        "deviceid": "1234567.py.service",
+        "version": "4.3.0",
+        "product": "Eastmoney",
+        "plat": "Web",
+        "FCODE": str(fcode),
     }
     async with ClientSession(headers=header_simple) as sess:
         try:
             async with sess.get(_api, params=params) as res:
                 if res.status == 200:
                     data = await res.json()
-                    logger.info(
-                        f"[SayuStock]获取{params['FCODE']}持仓数据成功"
-                    )
+                    logger.info(f"[SayuStock]获取{params['FCODE']}持仓数据成功")
                     return data
         except ClientError:
             logger.warning(f"[SayuStock]获取{params['FCODE']}持仓数据失败")
@@ -39,7 +39,7 @@ async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
 
 
 async def get_hours_from_em() -> Tuple[float, float]:
-    URL = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=2'  # noqa: E501
+    URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=2"  # noqa: E501
     y = 0
     ya = 0
     for mk in ['1.000001', '0.399001']:
@@ -49,7 +49,7 @@ async def get_hours_from_em() -> Tuple[float, float]:
                 async with sess.get(url) as res:
                     if res.status == 200:
                         data = await res.json()
-                        ya0, y0 = calculate_difference(data['data']['trends'])
+                        ya0, y0 = calculate_difference(data["data"]["trends"])
                         y += y0
                         ya += ya0
             except ClientError:
@@ -57,51 +57,49 @@ async def get_hours_from_em() -> Tuple[float, float]:
     return ya, y
 
 
-async def get_code_id(
-    code: str, priority: Optional[str] = None
-) -> Optional[Tuple[str, str, str]]:
+async def get_code_id(code: str, priority: Optional[str] = None) -> Optional[Tuple[str, str, str]]:
     """
     生成东方财富股票专用的行情ID
     code:可以是代码或简称或英文
     """
-    if code.endswith('.h'):
-        code = code.replace('.h', '')
-        priority = 'h'
-    elif code.endswith('.hk'):
-        code = code.replace('.hk', '')
-        priority = 'h'
-    elif code.endswith('.us'):
-        code = code.replace('.us', '')
-        priority = 'us'
-    elif code.endswith('.a'):
-        code = code.replace('.a', '')
-        priority = 'a'
+    if code.endswith(".h"):
+        code = code.replace(".h", "")
+        priority = "h"
+    elif code.endswith(".hk"):
+        code = code.replace(".hk", "")
+        priority = "h"
+    elif code.endswith(".us"):
+        code = code.replace(".us", "")
+        priority = "us"
+    elif code.endswith(".a"):
+        code = code.replace(".a", "")
+        priority = "a"
 
     if priority is not None:
         priority = priority.lower()
 
     is_bond = False
-    if code in ['us10y', 'us30y', 'us2y', 'cn10y', 'cn30y', 'cn2y', 'tlm']:
+    if code in ["us10y", "us30y", "us2y", "cn10y", "cn30y", "cn2y", "tlm"]:
         is_bond = True
 
-    if '.' in code:
-        code_prefix = code.split('.')[0]
+    if "." in code:
+        code_prefix = code.split(".")[0]
         if code_prefix in PREFIX_DATA:
             _sec_type = PREFIX_DATA[code_prefix]
         else:
-            _sec_type = '未知'
+            _sec_type = "未知"
 
-        return code, '', _sec_type
+        return code, "", _sec_type
 
     if code in code_id_dict.keys():
-        return code_id_dict[code], code, ''
+        return code_id_dict[code], code, ""
 
-    url = 'https://searchapi.eastmoney.com/api/suggest/get'
+    url = "https://searchapi.eastmoney.com/api/suggest/get"
     params = (
-        ('input', f'{code}'),
-        ('type', '14'),
-        ('token', 'D43BF722C8E33BDC906FB84D85E326E8'),
-        ('count', '4'),
+        ("input", f"{code}"),
+        ("type", "14"),
+        ("token", "D43BF722C8E33BDC906FB84D85E326E8"),
+        ("count", "4"),
     )
     async with ClientSession(headers=header_simple) as sess:
         try:
@@ -166,44 +164,40 @@ async def get_code_id(
 
 
 async def get_image_from_em(
-    name: str = '0.899001',
+    name: str = "0.899001",
     size: Optional[Tuple[int, int]] = None,
 ) -> Image.Image:
-    WEBPIC = 'https://webquotepic.eastmoney.com/GetPic.aspx'
-    url = f'{WEBPIC}?nid={name}&imageType=FFRST&type=ffr'
+    WEBPIC = "https://webquotepic.eastmoney.com/GetPic.aspx"
+    url = f"{WEBPIC}?nid={name}&imageType=FFRST&type=ffr"
 
-    file = get_file(name, 'png')
+    file = get_file(name, "png")
     if file.exists():
         # 检查文件的修改时间是否在一分钟以内
-        minutes = STOCK_CONFIG.get_config('mapcloud_refresh_minutes').data
+        minutes = STOCK_CONFIG.get_config("mapcloud_refresh_minutes").data
         file_mod_time = datetime.fromtimestamp(file.stat().st_mtime)
         if datetime.now() - file_mod_time < timedelta(minutes=minutes):
-            logger.info(
-                f"[SayuStock] image文件在{minutes}分钟内，直接返回文件数据。"
-            )
+            logger.info(f"[SayuStock] image文件在{minutes}分钟内，直接返回文件数据。")
             try:
                 img = Image.open(file)
                 if size:
                     return img.resize(size)
                 return img
             except UnidentifiedImageError:
-                logger.warning(
-                    f"[SayuStock]{name}已存在文件读取失败, 尝试重新下载..."
-                )
+                logger.warning(f"[SayuStock]{name}已存在文件读取失败, 尝试重新下载...")
 
     async with ClientSession(headers=header_simple) as sess:
         try:
-            logger.info(f'[SayuStock]开始下载: {name} | 地址: {url}')
+            logger.info(f"[SayuStock]开始下载: {name} | 地址: {url}")
             async with sess.get(url) as res:
                 if res.status == 200:
                     content = await res.read()
-                    logger.info(f'[SayuStock]下载成功: {name}')
+                    logger.info(f"[SayuStock]下载成功: {name}")
                 else:
                     logger.warning(f"[SayuStock]{name}下载失败")
                     return Image.new('RGBA', (256, 256))
         except ClientError:
             logger.warning(f"[SayuStock]{name}下载失败")
-            return Image.new('RGBA', (256, 256))
+            return Image.new("RGBA", (256, 256))
 
     async with aiofiles.open(str(file), "wb") as f:
         await f.write(content)
