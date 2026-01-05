@@ -263,8 +263,6 @@ async def to_single_fig(raw_data: Dict):
     total_amount = number_to_chinese(raw["f48"]) if isinstance(raw["f48"], float) else 0
 
     code_id = raw_data.get("file_name")
-    if code_id:
-        code_id = code_id.split("_")[0]
     # 遍历TIME_RANGE如果存在没有数据的时间则插入空数据
     full_data = []
     existing_times = set(item["datetime"] for item in price_histroy)
