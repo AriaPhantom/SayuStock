@@ -533,11 +533,17 @@ async def stock_request(
 async def get_dc_token():
     global DC_TOKEN
     async with async_playwright() as p:
-        # 启动浏览器（默认 Chromium）
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
-        )
+        try:
+            # 启动浏览器（默认 Chromium）
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
+            )
+        except Exception as e:
+            logger.error(
+                f"[SayuStock]以此启动浏览器失败, 请尝试在终端输入 `playwright install` 安装浏览器\n错误信息: {e}"
+            )
+            return ""
 
         # 创建上下文和页面
         context = await browser.new_context(
@@ -560,5 +566,8 @@ async def get_dc_token():
             DC_TOKEN = ";".join(cl)
             logger.debug(f"[SayuStock] 设置DC-Cookie: {DC_TOKEN}")
             return DC_TOKEN
+        except Exception as e:
+            logger.error(f"[SayuStock] 获取DC-Token失败: {e}")
+            return ""
         finally:
             await browser.close()
