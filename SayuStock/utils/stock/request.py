@@ -539,11 +539,25 @@ async def get_dc_token():
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
             )
-        except Exception as e:
-            logger.error(
-                f"[SayuStock]以此启动浏览器失败, 请尝试在终端输入 `playwright install` 安装浏览器\n错误信息: {e}"
-            )
-            return ""
+        except Exception:
+            logger.warning("[SayuStock] 浏览器启动失败，尝试自动安装 Chromium...")
+            try:
+                # 自动安装
+                install_args = [sys.executable, "-m", "playwright", "install", "chromium"]
+                proc = await asyncio.create_subprocess_exec(*install_args)
+                await proc.wait()
+
+                # 重试启动
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception as e:
+                logger.error(
+                    f"[SayuStock]以此启动浏览器及自动安装均失败, 请尝试在终端手动输入 `playwright install` 安装浏览器"
+                    f"\n错误信息: {e}"
+                )
+                return ""
 
         # 创建上下文和页面
         context = await browser.new_context(
