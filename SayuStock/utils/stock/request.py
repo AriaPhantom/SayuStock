@@ -1,10 +1,12 @@
 import json
 import random
 import asyncio
-from typing import Any, Dict, List, Tuple, Union, Literal, Optional
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Tuple, Union, Literal, Optional
 
 from yarl import URL
+from gsuid_core.logger import logger
+from playwright.async_api import async_playwright
 from aiohttp import (
     FormData,
     TCPConnector,
@@ -13,13 +15,17 @@ from aiohttp import (
     ContentTypeError,
     ServerDisconnectedError,
 )
-from playwright.async_api import async_playwright
 
-from gsuid_core.logger import logger
-
-from .utils import async_file_cache
 from .get_vix import get_vix_data
-from ..get_OKX import analyze_market_target, get_crypto_trend_as_json, get_crypto_history_kline_as_json
+from .utils import async_file_cache
+from .request_utils import get_code_id
+from ..load_data import get_full_security_code
+from ...stock_config.stock_config import STOCK_CONFIG
+from ..get_OKX import (
+    analyze_market_target,
+    get_crypto_trend_as_json,
+    get_crypto_history_kline_as_json,
+)
 from ..constant import (
     UA,
     DC_COOKIES,
@@ -32,9 +38,6 @@ from ..constant import (
     request_header,
     trade_detail_dict,
 )
-from ..load_data import get_full_security_code
-from .request_utils import get_code_id
-from ...stock_config.stock_config import STOCK_CONFIG
 
 MENU_CACHE = {}
 DC_TOKEN = ""
@@ -498,7 +501,7 @@ async def stock_request(
                 async with client.request(
                     method,
                     url=final_url,
-                    # headers=header,
+                    headers=header,
                     params=params,
                     json=_json,
                     data=data,
@@ -513,11 +516,13 @@ async def stock_request(
 
                     if resp.status != 200:
                         logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
+                        if resp.status == 403:
+                            raise ServerDisconnectedError("403 Forbidden")
                         return -999
                     return raw_data
             except ServerDisconnectedError:
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                # header['cookie'] = await get_dc_token()
+                header["Cookie"] = await get_dc_token()
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
