@@ -543,6 +543,8 @@ async def get_dc_token():
             logger.warning("[SayuStock] 浏览器启动失败，尝试自动安装 Chromium...")
             try:
                 # 自动安装
+                import sys
+
                 install_args = [sys.executable, "-m", "playwright", "install", "chromium"]
                 proc = await asyncio.create_subprocess_exec(*install_args)
                 await proc.wait()
