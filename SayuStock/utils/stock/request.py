@@ -1,12 +1,10 @@
 import json
 import random
 import asyncio
-from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple, Union, Literal, Optional
+from datetime import datetime, timedelta
 
 from yarl import URL
-from gsuid_core.logger import logger
-from playwright.async_api import async_playwright
 from aiohttp import (
     FormData,
     TCPConnector,
@@ -15,17 +13,13 @@ from aiohttp import (
     ContentTypeError,
     ServerDisconnectedError,
 )
+from playwright.async_api import async_playwright
 
+from gsuid_core.logger import logger
+
+from .utils import async_file_cache, calculate_difference
 from .get_vix import get_vix_data
-from .utils import async_file_cache
-from .request_utils import get_code_id
-from ..load_data import get_full_security_code
-from ...stock_config.stock_config import STOCK_CONFIG
-from ..get_OKX import (
-    analyze_market_target,
-    get_crypto_trend_as_json,
-    get_crypto_history_kline_as_json,
-)
+from ..get_OKX import analyze_market_target, get_crypto_trend_as_json, get_crypto_history_kline_as_json
 from ..constant import (
     UA,
     DC_COOKIES,
@@ -35,13 +29,44 @@ from ..constant import (
     ErroText,
     market_dict,
     header_simple,
+    chinese_stocks,
     request_header,
     trade_detail_dict,
 )
+from ..load_data import get_full_security_code
+from .request_utils import get_code_id
+from ...stock_config.stock_config import STOCK_CONFIG
 
 MENU_CACHE = {}
 DC_TOKEN = ""
 NOW_QUEUE = 0
+
+
+async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
+    URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
+    y = 0
+    ya = 0
+    last_trade_date: Optional[datetime] = None
+    for mk in ["1.000001", "0.399001"]:
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+            "ndays": "2",
+            "secid": mk,
+        }
+        data = await stock_request(
+            URL,
+            "GET",
+            params=params,
+        )
+        if isinstance(data, int):
+            logger.warning(f"[SayuStock] 获取{mk}数据失败, 错误码: {data}")
+            continue
+        ya0, y0, ltd = calculate_difference(data["data"]["trends"])
+        y += y0
+        ya += ya0
+        last_trade_date = ltd
+    return ya, y, last_trade_date
 
 
 async def get_bar():
@@ -420,7 +445,7 @@ async def get_hotmap():
         return f"[SayuStock] 错误代码: {resp}"
 
     bk: List[str] = []
-    for i in resp["bk"]:
+    for i in resp["data"]:
         assert isinstance(i, str)
         data = i.split("|")
         bk.append(data[0])
@@ -440,14 +465,22 @@ async def get_hotmap():
         if "|" in i:
             data = i.split("|")
             diff = {
-                "f2": float(data[15]) / 100 if data[15] != "-" else 0,
-                "f3": float(data[6]) / 100 if data[6] != "-" else 0,
-                "f6": float(data[13]) if data[13] != "-" else 0,
-                "f12": data[3],
-                "f14": data[1],
-                "f20": float(data[17]) * 100000 if data[17] != "-" else 0,
-                "f100": bk[int(data[0])],
-                "dd": data[4][1:-1].split(","),
+                # 最新
+                "f2": float(data[12]) / 100 if data[12] != "-" else 0,
+                # 涨幅
+                "f3": float(data[3]) / 100 if data[3] != "-" else 0,
+                # 成交额
+                "f6": float(data[10]) if data[10] != "-" else 0,
+                # 代码
+                "f12": data[1],
+                # 名称
+                "f14": chinese_stocks.get(data[1], {"name": data[1]})["name"],
+                # 市值
+                "f20": float(data[13]) * 100000 if data[13] != "-" else 0,
+                # 所属板块
+                "f100": chinese_stocks.get(data[1], {"industry_l1": data[1]})["industry_l1"],
+                # 不知道是啥, 先注释
+                # "dd": data[4][1:-1].split(","),
             }
             result["data"]["diff"].append(diff)
 
@@ -476,7 +509,7 @@ async def stock_request(
         (
             "https://quote.eastmoney.com/center/api/sidemenu_new.json",
             "https://quote.eastmoney.com/stockhotmap/api/getquotedata",
-            "https://push2his.eastmoney.com",
+            # "https://push2his.eastmoney.com",
             "https://quotederivates.eastmoney.com",
         )
     ):
@@ -501,7 +534,7 @@ async def stock_request(
                 async with client.request(
                     method,
                     url=final_url,
-                    headers=header,
+                    # headers=header,
                     params=params,
                     json=_json,
                     data=data,
@@ -516,13 +549,11 @@ async def stock_request(
 
                     if resp.status != 200:
                         logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
-                        if resp.status == 403:
-                            raise ServerDisconnectedError("403 Forbidden")
                         return -999
                     return raw_data
             except ServerDisconnectedError:
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                header["Cookie"] = await get_dc_token()
+                # header['cookie'] = await get_dc_token()
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
@@ -533,33 +564,11 @@ async def stock_request(
 async def get_dc_token():
     global DC_TOKEN
     async with async_playwright() as p:
-        try:
-            # 启动浏览器（默认 Chromium）
-            browser = await p.chromium.launch(
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
-            )
-        except Exception:
-            logger.warning("[SayuStock] 浏览器启动失败，尝试自动安装 Chromium...")
-            try:
-                # 自动安装
-                import sys
-
-                install_args = [sys.executable, "-m", "playwright", "install", "chromium"]
-                proc = await asyncio.create_subprocess_exec(*install_args)
-                await proc.wait()
-
-                # 重试启动
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-            except Exception as e:
-                logger.error(
-                    f"[SayuStock]以此启动浏览器及自动安装均失败, 请尝试在终端手动输入 `playwright install` 安装浏览器"
-                    f"\n错误信息: {e}"
-                )
-                return ""
+        # 启动浏览器（默认 Chromium）
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
+        )
 
         # 创建上下文和页面
         context = await browser.new_context(
@@ -582,8 +591,5 @@ async def get_dc_token():
             DC_TOKEN = ";".join(cl)
             logger.debug(f"[SayuStock] 设置DC-Cookie: {DC_TOKEN}")
             return DC_TOKEN
-        except Exception as e:
-            logger.error(f"[SayuStock] 获取DC-Token失败: {e}")
-            return ""
         finally:
             await browser.close()

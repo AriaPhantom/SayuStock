@@ -5,14 +5,13 @@ from datetime import datetime, timedelta
 
 import aiofiles
 from PIL import Image, UnidentifiedImageError
-from aiohttp import ClientError, ClientSession, ClientConnectorError
+from aiohttp import ClientSession, ClientConnectorError
 
 from gsuid_core.logger import logger
 
-from .utils import get_file, calculate_difference
+from .utils import get_file
 from ..constant import PREFIX_DATA, code_id_dict
 from ...stock_config.stock_config import STOCK_CONFIG
-from ..constant import PREFIX_DATA, code_id_dict, header_simple
 
 
 async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
@@ -26,35 +25,16 @@ async def get_fund_pos_list(fcode: Union[str, int]) -> Optional[Dict]:
         "plat": "Web",
         "FCODE": str(fcode),
     }
-    async with ClientSession(headers=header_simple) as sess:
+    async with ClientSession() as sess:
         try:
             async with sess.get(_api, params=params) as res:
                 if res.status == 200:
                     data = await res.json()
                     logger.info(f"[SayuStock]获取{params['FCODE']}持仓数据成功")
                     return data
-        except ClientError:
+        except ClientConnectorError:
             logger.warning(f"[SayuStock]获取{params['FCODE']}持仓数据失败")
     return None
-
-
-async def get_hours_from_em() -> Tuple[float, float]:
-    URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get?fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&ndays=2"  # noqa: E501
-    y = 0
-    ya = 0
-    for mk in ['1.000001', '0.399001']:
-        url = URL + '&secid=' + mk
-        async with ClientSession(headers=header_simple) as sess:
-            try:
-                async with sess.get(url) as res:
-                    if res.status == 200:
-                        data = await res.json()
-                        ya0, y0 = calculate_difference(data["data"]["trends"])
-                        y += y0
-                        ya += ya0
-            except ClientError:
-                logger.warning(f"[SayuStock]获取{mk}数据失败")
-    return ya, y
 
 
 async def get_code_id(code: str, priority: Optional[str] = None) -> Optional[Tuple[str, str, str]]:
@@ -101,65 +81,58 @@ async def get_code_id(code: str, priority: Optional[str] = None) -> Optional[Tup
         ("token", "D43BF722C8E33BDC906FB84D85E326E8"),
         ("count", "4"),
     )
-    async with ClientSession(headers=header_simple) as sess:
-        try:
-            async with sess.get(url, params=params) as res:
-                if res.status == 200:
-                    logger.debug(f"[SayuStock]开始获取{code}的ID")
-                    text = await res.text()
-                    logger.debug(text)
-                    data = json.loads(text)
-                    code_dict: List[Dict] = data['QuotationCodeTable']['Data']
-                    if code_dict:
-                        # 排序：SecurityTypeName为"债券"的排到最后
-                        if not is_bond:
-                            code_dict.sort(
-                                key=lambda x: x.get('SecurityTypeName')
-                                == '债券'
-                            )
-                        for i in code_dict:
-                            if priority is None:
-                                return (
-                                    i['QuoteID'],
-                                    i['Name'],
-                                    i['SecurityTypeName'],
-                                )
-                            elif priority == 'h':
-                                if i['SecurityTypeName'] in ['港股']:
-                                    return (
-                                        i['QuoteID'],
-                                        i['Name'],
-                                        i['SecurityTypeName'],
-                                    )
-                            elif priority == 'us':
-                                if i['SecurityTypeName'] in ['美股', '粉单']:
-                                    return (
-                                        i['QuoteID'],
-                                        i['Name'],
-                                        i['SecurityTypeName'],
-                                    )
-                            elif priority == 'a':
-                                if i['SecurityTypeName'] in [
-                                    '沪深A',
-                                    '沪A',
-                                    '深A',
-                                ]:
-                                    return (
-                                        i['QuoteID'],
-                                        i['Name'],
-                                        i['SecurityTypeName'],
-                                    )
-                        else:
+    async with ClientSession() as sess:
+        async with sess.get(url, params=params) as res:
+            if res.status == 200:
+                logger.debug(f"[SayuStock]开始获取{code}的ID")
+                text = await res.text()
+                logger.debug(text)
+                data = json.loads(text)
+                code_dict: List[Dict] = data["QuotationCodeTable"]["Data"]
+                if code_dict:
+                    # 排序：SecurityTypeName为"债券"的排到最后
+                    if not is_bond:
+                        code_dict.sort(key=lambda x: x.get("SecurityTypeName") == "债券")
+                    for i in code_dict:
+                        if priority is None:
                             return (
-                                code_dict[0]['QuoteID'],
-                                code_dict[0]['Name'],
-                                i['SecurityTypeName'],
+                                i["QuoteID"],
+                                i["Name"],
+                                i["SecurityTypeName"],
                             )
+                        elif priority == "h":
+                            if i["SecurityTypeName"] in ["港股"]:
+                                return (
+                                    i["QuoteID"],
+                                    i["Name"],
+                                    i["SecurityTypeName"],
+                                )
+                        elif priority == "us":
+                            if i["SecurityTypeName"] in ["美股", "粉单"]:
+                                return (
+                                    i["QuoteID"],
+                                    i["Name"],
+                                    i["SecurityTypeName"],
+                                )
+                        elif priority == "a":
+                            if i["SecurityTypeName"] in [
+                                "沪深A",
+                                "沪A",
+                                "深A",
+                            ]:
+                                return (
+                                    i["QuoteID"],
+                                    i["Name"],
+                                    i["SecurityTypeName"],
+                                )
                     else:
-                        return None
-        except ClientError:
-            logger.warning(f"[SayuStock]获取{code}ID失败")
-            return None
+                        return (
+                            code_dict[0]["QuoteID"],
+                            code_dict[0]["Name"],
+                            i["SecurityTypeName"],
+                        )
+                else:
+                    return None
     return None
 
 
@@ -185,7 +158,7 @@ async def get_image_from_em(
             except UnidentifiedImageError:
                 logger.warning(f"[SayuStock]{name}已存在文件读取失败, 尝试重新下载...")
 
-    async with ClientSession(headers=header_simple) as sess:
+    async with ClientSession() as sess:
         try:
             logger.info(f"[SayuStock]开始下载: {name} | 地址: {url}")
             async with sess.get(url) as res:
@@ -194,8 +167,8 @@ async def get_image_from_em(
                     logger.info(f"[SayuStock]下载成功: {name}")
                 else:
                     logger.warning(f"[SayuStock]{name}下载失败")
-                    return Image.new('RGBA', (256, 256))
-        except ClientError:
+                    return Image.new("RGBA", (256, 256))
+        except ClientConnectorError:
             logger.warning(f"[SayuStock]{name}下载失败")
             return Image.new("RGBA", (256, 256))
 
