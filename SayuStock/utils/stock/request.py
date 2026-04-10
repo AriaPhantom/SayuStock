@@ -22,7 +22,6 @@ from .get_vix import get_vix_data
 from ..get_OKX import analyze_market_target, get_crypto_trend_as_json, get_crypto_history_kline_as_json
 from ..constant import (
     UA,
-    DC_COOKIES,
     SINGLE_LINE_FIELDS1,
     SINGLE_LINE_FIELDS2,
     SINGLE_STOCK_FIELDS,
@@ -35,7 +34,6 @@ from ..constant import (
 )
 from ..load_data import get_full_security_code
 from .request_utils import get_code_id
-from ...stock_config.stock_config import STOCK_CONFIG
 
 MENU_CACHE = {}
 DC_TOKEN = ""
@@ -500,11 +498,6 @@ async def stock_request(
     logger.info(f"[SayuStock] 请求: {url}")
     logger.info(f"[SayuStock] Params: {params}")
 
-    cookies = STOCK_CONFIG.get_config("eastmoney_cookie").data
-    if cookies:
-        logger.info(f"[SayuStock] Cookie: {cookies}")
-        header["Cookie"] = cookies
-
     if url.startswith(
         (
             "https://quote.eastmoney.com/center/api/sidemenu_new.json",
@@ -515,15 +508,16 @@ async def stock_request(
     ):
         header = header_simple
 
+    base_header = dict(header)
+    base_header.pop("Cookie", None)
+    retry_cookie = ""
+
     async with ClientSession(
         connector=TCPConnector(verify_ssl=True),
-        headers=header,
-        cookies=DC_COOKIES,
+        headers=base_header,
     ) as client:
         final_url = str(URL(url).with_query(params or {}))
         logger.info(f"[SayuStock] 最终请求URL：{final_url}")
-
-        # header['cookie'] = DC_TOKEN
 
         while NOW_QUEUE >= 6:
             await asyncio.sleep(random.uniform(0.4, 0.9))
@@ -531,10 +525,13 @@ async def stock_request(
         for _ in range(2):
             try:
                 NOW_QUEUE += 1
+                request_headers = dict(base_header)
+                if retry_cookie:
+                    request_headers["Cookie"] = retry_cookie
                 async with client.request(
                     method,
                     url=final_url,
-                    # headers=header,
+                    headers=request_headers,
                     params=params,
                     json=_json,
                     data=data,
@@ -549,11 +546,13 @@ async def stock_request(
 
                     if resp.status != 200:
                         logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
+                        if resp.status == 403:
+                            raise ServerDisconnectedError("403 Forbidden")
                         return -999
                     return raw_data
             except ServerDisconnectedError:
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                # header['cookie'] = await get_dc_token()
+                retry_cookie = await get_dc_token()
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
@@ -564,13 +563,37 @@ async def stock_request(
 async def get_dc_token():
     global DC_TOKEN
     async with async_playwright() as p:
-        # 启动浏览器（默认 Chromium）
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
-        )
+        try:
+            # Launch Chromium first.
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--disable-blink-features=AutomationControlled"],
+            )
+        except Exception:
+            logger.warning("[SayuStock] Chromium launch failed, trying playwright install...")
+            try:
+                import sys
 
-        # 创建上下文和页面
+                install_args = [
+                    sys.executable,
+                    "-m",
+                    "playwright",
+                    "install",
+                    "chromium",
+                ]
+                proc = await asyncio.create_subprocess_exec(*install_args)
+                await proc.wait()
+
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+            except Exception as e:
+                logger.error(
+                    f"[SayuStock] Chromium install/relaunch failed. Run `playwright install` manually if needed. Error: {e}"
+                )
+                return ""
+
         context = await browser.new_context(
             user_agent=UA,
             viewport={"width": 1366, "height": 768},
@@ -578,18 +601,20 @@ async def get_dc_token():
         page = await context.new_page()
 
         try:
-            # 导航到目标页面
             await page.goto(
                 "https://www.eastmoney.com/",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
                 timeout=20000,
             )
-            # 获取所有 Cookie
+            await page.wait_for_timeout(1500)
             cookies = await context.cookies()
-            logger.debug(f"[SayuStock] 获取DC-Cookie: {cookies}")
+            logger.debug(f"[SayuStock] DC cookies fetched: {cookies}")
             cl = [f"{cookie['name']}={cookie['value']}" for cookie in cookies]  # type: ignore # noqa: E501
             DC_TOKEN = ";".join(cl)
-            logger.debug(f"[SayuStock] 设置DC-Cookie: {DC_TOKEN}")
+            logger.debug(f"[SayuStock] DC cookie header set: {DC_TOKEN}")
             return DC_TOKEN
+        except Exception as e:
+            logger.error(f"[SayuStock] Failed to fetch DC-Token: {e}")
+            return ""
         finally:
             await browser.close()

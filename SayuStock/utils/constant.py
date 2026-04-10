@@ -95,23 +95,12 @@ header_simple = {
     "sec-ch-ua-platform": '"Windows"',
 }
 
-DC_COOKIES = {
-    "qgqp_b_id": "a4ad5101a1218975271d02d73aacf03a",
-    "st_nvi": "MaWBmK2ref7oCBA_DkWhW1ede",
-    "nid": "077407b960092c0310185ecdc5f8c00b",
-    "nid_create_time": "1756794328056",
-    "gvi": "HfIZExkHZlE5FTRjZeVKca89c",
-    "gvi_create_time": "1756794328056",
-}
+DC_COOKIES = {}
 
 request_header = {
     "User-Agent": UA,
     "Accept": "*/*",
     "Accept-Language": AL,
-    "Cookie": "qgqp_b_id=659a53f35cc91d08833fd26098e9ce34; st_nvi=DXIDHc92MckKhvIssg8zda85c;"
-    " nid=0ff5d2da99cd123247ff24b723a17e3c; "
-    "nid_create_time=1762029542554; gvi=VIzYcS_d6R9H3UQkE2C7078a4; gvi_create_time=1762029542554; "
-    "websitepoptg_api_time=1762781584093; fullscreengg=1; fullscreengg2=1",
     "Dnt": "1",
     # "Host": "push2his.eastmoney.com",
     "sec-ch-ua": '''"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"''',

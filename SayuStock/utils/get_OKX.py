@@ -1,3 +1,4 @@
+import os
 import re
 import math
 import asyncio
@@ -148,36 +149,102 @@ def analyze_market_target(query: str):
 
 
 async def get_all_crypto_price():
-    async with httpx.AsyncClient() as client:
+    async def fetch(crypto: str):
+        data = await get_price_and_change_simple(crypto)
+        if data:
+            price = data["price"]
+            change_24h_percent = data["change_24h_percent"]
+            return (
+                crypto,
+                {
+                    "f58": crypto,
+                    "f14": crypto,
+                    "f43": price,
+                    "f170": change_24h_percent,
+                    "f48": "",
+                },
+            )
+        return None
 
-        async def fetch(crypto: str):
-            data = await get_price_and_change_simple(crypto, client)
-            if data:
-                price = data["price"]
-                change_24h_percent = data["change_24h_percent"]
-                return (
-                    crypto,
-                    {
-                        "f58": crypto,
-                        "f14": crypto,
-                        "f43": price,
-                        "f170": change_24h_percent,
-                        "f48": "",
-                    },
-                )
-            return None
-
-        tasks = [
-            fetch(crypto)
-            for crypto in [
-                "BTC",
-                "ETH",
-                "SOL",
-                "XRP",
-            ]
+    tasks = [
+        fetch(crypto)
+        for crypto in [
+            "BTC",
+            "ETH",
+            "SOL",
+            "XRP",
         ]
-        results = await asyncio.gather(*tasks)
-        return {crypto: info for item in results if item for crypto, info in [item]}
+    ]
+    results = await asyncio.gather(*tasks)
+    return {crypto: info for item in results if item for crypto, info in [item]}
+
+
+def get_okx_proxy_candidates() -> list[Optional[str]]:
+    candidates: list[Optional[str]] = []
+    for proxy in (
+        os.getenv("SAYUSTOCK_OKX_PROXY"),
+        os.getenv("HTTPS_PROXY"),
+        os.getenv("HTTP_PROXY"),
+    ):
+        if proxy:
+            proxy = proxy.strip()
+        if proxy and proxy not in candidates:
+            candidates.append(proxy)
+    for fallback in ("http://127.0.0.1:7890", None):
+        if fallback not in candidates:
+            candidates.append(fallback)
+    return candidates
+
+
+def build_okx_client(proxy: Optional[str], timeout: float = 10.0) -> httpx.AsyncClient:
+    if proxy:
+        mounts = {
+            "http://": httpx.AsyncHTTPTransport(proxy=proxy),
+            "https://": httpx.AsyncHTTPTransport(proxy=proxy),
+        }
+        return httpx.AsyncClient(mounts=mounts, timeout=timeout)
+    return httpx.AsyncClient(timeout=timeout)
+
+
+async def _get_price_and_change_simple_once(
+    crypto: str,
+    client: httpx.AsyncClient,
+):
+    url = "https://www.okx.com/api/v5/market/index-tickers"
+    params = {"instId": CRYPTO_MAP.get(crypto, crypto)}
+
+    logger.info(f"姝ｅ湪寮傛鏌ヨ {crypto} 鎸囨暟琛屾儏...")
+    response = await client.get(url, params=params)
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("code") != "0":
+        logger.error(f"API 杩斿洖閿欒: {data.get('msg')}")
+        return None
+
+    ticker_info = data["data"][0]
+
+    current_price = float(ticker_info.get("idxPx", "0"))
+    open_24h_price = float(ticker_info.get("open24h", "0"))
+    open_utc8_price = float(ticker_info.get("sodUtc8", "0"))
+
+    if open_24h_price == 0:
+        change_24h_percent = float("inf")
+    else:
+        change_24h_percent = ((current_price - open_24h_price) / open_24h_price) * 100
+
+    if open_utc8_price == 0:
+        change_utc8_daily_percent = float("inf")
+    else:
+        change_utc8_daily_percent = ((current_price - open_utc8_price) / open_utc8_price) * 100
+
+    return {
+        "price": current_price,
+        "open_24h": open_24h_price,
+        "open_utc8": open_utc8_price,
+        "change_24h_percent": change_24h_percent,
+        "change_utc8_daily_percent": change_utc8_daily_percent,
+    }
 
 
 @async_file_cache(market="{crypto}", sector="single-stock-crypto", suffix="json")
@@ -202,8 +269,8 @@ async def get_crypto_trend_as_json(
     if client is None:
         mounts = (
             {
-                "http://": httpx.HTTPTransport(proxy=proxy),
-                "https://": httpx.HTTPTransport(proxy=proxy),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy),
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy),
             }
             if proxy
             else None
@@ -470,8 +537,8 @@ async def get_crypto_history_kline_as_json(
     if client is None:
         mounts = (
             {
-                "http://": httpx.HTTPTransport(proxy=proxy),
-                "https://": httpx.HTTPTransport(proxy=proxy),
+                "http://": httpx.AsyncHTTPTransport(proxy=proxy),
+                "https://": httpx.AsyncHTTPTransport(proxy=proxy),
             }
             if proxy
             else None
@@ -607,55 +674,23 @@ async def get_price_and_change_simple(
     通过单次异步请求OKX指数API，高效获取BTC的最新价格、
     滚动24小时涨跌幅和UTC+8当天涨跌幅。
     """
-    url = "https://www.okx.com/api/v5/market/index-tickers"
-    params = {"instId": CRYPTO_MAP.get(crypto, crypto)}
-
-    # 如果没有传入client，则新建一个
-    close_client = False
-    if client is None:
-        client = httpx.AsyncClient()
-        close_client = True
-
     try:
-        logger.info(f"正在异步查询 {crypto} 指数行情...")
-        response = await client.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
+        if client is not None:
+            return await _get_price_and_change_simple_once(crypto, client)
 
-        if data.get("code") == "0":
-            ticker_info = data["data"][0]
+        last_error: Optional[httpx.HTTPError] = None
+        for proxy in get_okx_proxy_candidates():
+            try:
+                async with build_okx_client(proxy) as temp_client:
+                    return await _get_price_and_change_simple_once(crypto, temp_client)
+            except Exception as e:
+                if isinstance(e, httpx.HTTPError):
+                    last_error = e
+                logger.warning(f"OKX request via {proxy or 'direct'} failed: {e}")
 
-            current_price = float(ticker_info.get("idxPx", "0"))
-            open_24h_price = float(ticker_info.get("open24h", "0"))
-            open_utc8_price = float(ticker_info.get("sodUtc8", "0"))
-
-            if open_24h_price == 0:
-                change_24h_percent = float("inf")
-            else:
-                change_24h_percent = ((current_price - open_24h_price) / open_24h_price) * 100
-
-            if open_utc8_price == 0:
-                change_utc8_daily_percent = float("inf")
-            else:
-                change_utc8_daily_percent = ((current_price - open_utc8_price) / open_utc8_price) * 100
-
-            return {
-                "price": current_price,
-                "open_24h": open_24h_price,
-                "open_utc8": open_utc8_price,
-                "change_24h_percent": change_24h_percent,
-                "change_utc8_daily_percent": change_utc8_daily_percent,
-            }
-        else:
-            logger.error(f"API 返回错误: {data.get('msg')}")
-            return None
-
-    except httpx.RequestError as e:
-        logger.error(f"网络请求错误: {e}")
+        if last_error is not None:
+            logger.error(f"网络请求错误: {last_error}")
         return None
     except (KeyError, IndexError, ValueError) as e:
         logger.error(f"解析或计算数据时出错: {e}")
         return None
-    finally:
-        if close_client:
-            await client.aclose()
