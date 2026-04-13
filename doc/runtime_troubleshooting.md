@@ -43,6 +43,21 @@ Optional data now degrades cleanly:
 
 If these two extras fail, the image still renders.
 
+## 2026-04-12 deployment regression note
+
+The Huawei VPS later showed a separate deployment-side regression:
+
+1. the live plugin working tree contained unresolved Git conflict markers in `SayuStock/utils/stock/request.py`
+2. the local repo still had the old `draw_info.py` logic that treated AU/TLM as hard requirements
+
+Recovery / prevention:
+
+- reset the VPS plugin repo back to a clean committed state before restart
+- keep `draw_info.py` in the Git repo aligned with the graceful-degradation behavior above
+- after each deploy, run both:
+  - all-weather
+  - market overview
+
 ### 2. Stabilized DC-Token refresh flow
 
 - trigger token refresh on HTTP 403

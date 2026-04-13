@@ -178,8 +178,8 @@ async def draw_info_img(is_save: bool = False):
 
     results = await asyncio.gather(*tasks)
 
-    for result in results:
-        if isinstance(result, str):
+    for index, result in enumerate(results):
+        if isinstance(result, str) and index not in (5, 6):
             return result
 
     (
@@ -191,30 +191,34 @@ async def draw_info_img(is_save: bool = False):
         data_au,
         data_tlm,
         bars,
-    ) = cast(List[Dict], results)
+    ) = results
+
+    data_zs = cast(Dict, data_zs)
+    data_hy_z = cast(Dict, data_hy_z)
+    data_hy_f = cast(Dict, data_hy_f)
+    data_gn_z = cast(Dict, data_gn_z)
+    data_gn_f = cast(Dict, data_gn_f)
+    bars = cast(Dict, bars)
 
     data_hy_z = data_hy_z["data"]["diff"]
     data_hy_f = data_hy_f["data"]["diff"]
     data_gn_z = data_gn_z["data"]["diff"]
     data_gn_f = data_gn_f["data"]["diff"]
 
-    data_aud: Dict = data_au["data"]
-    data_tlmd: Dict = data_tlm["data"]
+    extra_index_data = []
+    for single_data in (data_au, data_tlm):
+        if isinstance(single_data, str):
+            continue
 
-    data_aud["f14"] = data_aud["f58"]
-    data_aud["f3"] = data_aud["f170"]
-    data_aud["f6"] = data_aud["f48"]
-    data_aud["f2"] = data_aud["f43"]
-    data_aud["f100"] = "-"
+        single_diff: Dict = single_data["data"]
+        single_diff["f14"] = single_diff["f58"]
+        single_diff["f3"] = single_diff["f170"]
+        single_diff["f6"] = single_diff["f48"]
+        single_diff["f2"] = single_diff["f43"]
+        single_diff["f100"] = "-"
+        extra_index_data.append(single_diff)
 
-    data_tlmd["f14"] = data_tlmd["f58"]
-    data_tlmd["f3"] = data_tlmd["f170"]
-    data_tlmd["f6"] = data_tlmd["f48"]
-    data_tlmd["f2"] = data_tlmd["f43"]
-    data_tlmd["f100"] = "-"
-
-    data_zs["data"]["diff"].append(data_aud)
-    data_zs["data"]["diff"].append(data_tlmd)
+    data_zs["data"]["diff"].extend(extra_index_data)
 
     zf: List[int] = bars["2"]
     df: List[int] = bars["3"]
