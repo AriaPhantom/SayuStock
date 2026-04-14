@@ -7,9 +7,7 @@ SayuStock AI Tools 注册模块
 
 from datetime import datetime
 
-from pydantic_ai import RunContext
-
-from gsuid_core.ai_core.models import ToolContext
+from gsuid_core.models import Event
 from gsuid_core.ai_core.register import ai_tools
 
 from ..utils.utils import get_vix_name
@@ -24,7 +22,6 @@ from ..utils.stock.request_utils import get_code_id
 
 @ai_tools()
 async def get_stock_basic(
-    ctx: RunContext[ToolContext],
     stock_code: str,
 ) -> str:
     """
@@ -55,7 +52,6 @@ async def get_stock_basic(
 
 @ai_tools()
 async def get_market_summary(
-    ctx: RunContext[ToolContext],
 ) -> str:
     """
     获取大盘概览信息
@@ -79,7 +75,6 @@ async def get_market_summary(
 
 @ai_tools()
 async def get_sector_leader(
-    ctx: RunContext[ToolContext],
     sector_type: str = "行业板块",
 ) -> str:
     """
@@ -107,7 +102,6 @@ async def get_sector_leader(
 
 @ai_tools()
 async def get_fund_holdings(
-    ctx: RunContext[ToolContext],
     fund_code: str,
 ) -> str:
     """
@@ -139,7 +133,6 @@ async def get_fund_holdings(
 
 @ai_tools()
 async def get_latest_news(
-    ctx: RunContext[ToolContext],
     limit: int = 5,
 ) -> str:
     """
@@ -170,7 +163,6 @@ async def get_latest_news(
 
 @ai_tools()
 async def get_crypto_prices(
-    ctx: RunContext[ToolContext],
 ) -> str:
     """
     获取加密货币价格
@@ -193,7 +185,6 @@ async def get_crypto_prices(
 
 @ai_tools()
 async def get_vix_index(
-    ctx: RunContext[ToolContext],
     vix_type: str = "300",
 ) -> str:
     """
@@ -225,7 +216,6 @@ async def get_vix_index(
 
 @ai_tools()
 async def search_stock(
-    ctx: RunContext[ToolContext],
     query: str,
 ) -> str:
     """
@@ -246,7 +236,7 @@ async def search_stock(
 
 @ai_tools()
 async def get_my_watchlist(
-    ctx: RunContext[ToolContext],
+    ev: Event,
 ) -> str:
     """
     获取用户自选列表
@@ -254,10 +244,6 @@ async def get_my_watchlist(
     Returns:
         自选股票行情
     """
-    ev = ctx.deps.ev if ctx.deps else None
-    if ev is None:
-        return "无法获取用户信息"
-
     uid_list = await SsBind.get_uid_list_by_game(ev.user_id, ev.bot_id)
     if not uid_list:
         return "暂无自选股票"
