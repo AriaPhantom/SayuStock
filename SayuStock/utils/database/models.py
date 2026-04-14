@@ -29,6 +29,10 @@ class SsBind(Bind, table=True):
         if result is None:
             return -1
 
+        # 确保 result 是列表格式
+        if isinstance(result, str):
+            result = result.split('_') if result else []
+
         result = convert_list(result)
 
         if uid not in result:

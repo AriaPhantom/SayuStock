@@ -3,7 +3,7 @@ from gsuid_core.bot import Bot
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
 
-from ..utils.utils import get_vix_name
+from ..utils.utils import get_vix_name, convert_list
 from ..utils.database.models import SsBind
 from ..utils.stock.request_utils import get_code_id
 
@@ -94,6 +94,11 @@ async def delete_uid(bot: Bot, ev: Event):
     now_uid = await SsBind.get_uid_list_by_game(qid, ev.bot_id)
     if not now_uid:
         return await bot.send("您还未添加自选呢~请输入 添加自选 查看帮助!")
+
+    # 确保 now_uid 是列表格式
+    if isinstance(now_uid, str):
+        now_uid = now_uid.split('_') if now_uid else []
+    now_uid = convert_list(now_uid)
 
     u = uid.split(" ")
     add_dict = {}
