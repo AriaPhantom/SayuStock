@@ -28,6 +28,11 @@
 
 4. 发送`gs重启`应用插件
 
+> 默认部署说明：
+> 当前 fork 已禁用 `模型预测 / AI预测 / 趋势预测` 命令。
+> 这部分功能依赖额外的 `torch + Kronos` 运行时，容易导致轻量 VPS 部署卡在依赖安装或启动导入阶段。
+> 本 fork 默认不加载这条预测链路，以保证常规查股、新闻、自选和大盘功能稳定可用。
+
 ## 丨功能
 
 <details><summary>大盘概览</summary><p>
@@ -73,6 +78,8 @@
 <details><summary>我的个股 / 个股 证券ETF 通信ETF 中证白酒</summary><p>
 <a><img src="https://s2.loli.net/2025/09/05/P6U8wCLFGrkfI9p.png"></a>
 </p></details>
+
+> 说明：本 fork 默认不提供 `模型预测 / AI预测 / 趋势预测` 命令。
 
 
 ## 丨感谢&参考

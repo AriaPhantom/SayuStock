@@ -1,5 +1,20 @@
 # Runtime troubleshooting
 
+## Optional torch / Kronos runtime
+
+The `model prediction / AI prediction / trend prediction` command path depends on the bundled `Kronos` model code, which in turn requires a separate `torch` runtime.
+
+On lightweight VPS deployments this optional stack is easy to break in two ways:
+
+- `pip install torch ...` can hang or time out during download
+- partial hotfixes can leave `stock_ai` in a broken import state even when the main plugin should still work
+
+Current fork policy:
+
+- regular stock/news/watchlist/market features stay enabled
+- Kronos-based prediction commands are disabled by default
+- do not block plugin startup on `torch` / `Kronos`
+
 ## Dashboard request path
 
 The `market overview` image depends on these Eastmoney endpoints:
