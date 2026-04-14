@@ -128,3 +128,30 @@ Fixes in this patch:
 - only inject a freshly fetched DC token on retry
 - add OKX proxy fallback for the all-weather crypto panel
 - use `httpx.AsyncHTTPTransport` for OKX proxy mounts in async clients
+
+## 2026-04-15 all-weather slowdown follow-up
+
+Symptoms:
+
+- `all-weather` eventually succeeds, but becomes much slower than before
+- GSUID logs show repeated warnings like:
+  - `push2.eastmoney.com/api/qt/stock/trends2/get failed, trying DC-Token`
+
+Root cause:
+
+1. `draw_future_img()` fans out many Eastmoney `stock/*` requests concurrently.
+2. `stock_request()` was not reusing an already-fetched DC token on the first attempt.
+3. once one request hit HTTP 403, multiple concurrent requests could each trigger their own `get_dc_token()` flow.
+4. on VPS this meant repeated Playwright cookie bootstraps, extra warnings, and a much slower all-weather render.
+
+Fix in this patch:
+
+- reuse cached DC token before the first request for `https://push2.eastmoney.com/api/qt/stock/*`
+- serialize token refresh with an async lock
+- only force-refresh the token after an actual 403 retry path
+
+Expected effect:
+
+- the first Eastmoney stock request may still need one token bootstrap after process start
+- subsequent all-weather requests should avoid the repeated warning burst
+- total render time should drop materially because concurrent requests no longer all launch their own token refresh path

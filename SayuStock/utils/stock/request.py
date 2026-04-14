@@ -38,6 +38,11 @@ from .request_utils import get_code_id
 MENU_CACHE = {}
 DC_TOKEN = ""
 NOW_QUEUE = 0
+DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
+
+
+def _need_dc_token(url: str) -> bool:
+    return url.startswith("https://push2.eastmoney.com/api/qt/stock/")
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
@@ -528,6 +533,10 @@ async def stock_request(
                 request_headers = dict(base_header)
                 if retry_cookie:
                     request_headers["Cookie"] = retry_cookie
+                elif _need_dc_token(url):
+                    cached_cookie = await get_dc_token()
+                    if cached_cookie:
+                        request_headers["Cookie"] = cached_cookie
                 async with client.request(
                     method,
                     url=final_url,
@@ -552,7 +561,7 @@ async def stock_request(
                     return raw_data
             except ServerDisconnectedError:
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                retry_cookie = await get_dc_token()
+                retry_cookie = await get_dc_token(force_refresh=True)
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
@@ -560,7 +569,26 @@ async def stock_request(
             return -400016
 
 
-async def get_dc_token():
+async def get_dc_token(force_refresh: bool = False):
+    global DC_TOKEN, DC_TOKEN_LOCK
+
+    if DC_TOKEN and not force_refresh:
+        return DC_TOKEN
+
+    if DC_TOKEN_LOCK is None:
+        DC_TOKEN_LOCK = asyncio.Lock()
+
+    async with DC_TOKEN_LOCK:
+        if DC_TOKEN and not force_refresh:
+            return DC_TOKEN
+
+        token = await _fetch_dc_token()
+        if token:
+            DC_TOKEN = token
+        return DC_TOKEN
+
+
+async def _fetch_dc_token():
     global DC_TOKEN
     async with async_playwright() as p:
         try:
