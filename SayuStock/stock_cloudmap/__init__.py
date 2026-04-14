@@ -77,6 +77,10 @@ async def send_my_stock_img(bot: Bot, ev: Event):
     if not uid:
         return await bot.send("您还未添加自选呢~或者后跟具体股票代码, 例如：\n 个股 中证白酒 中证2000")
 
+    # 确保 uid 是列表格式（处理可能的字符串返回值）
+    if isinstance(uid, str):
+        uid = uid.split('_') if uid else []
+    
     uid = convert_list(uid)
     if len(uid) > 5:
         uid = uid[:5]
@@ -161,6 +165,10 @@ async def send_compare_img(bot: Bot, ev: Event):
         if not uid:
             return await bot.send("您还未添加自选呢~或者后跟具体股票代码, 例如：\n 个股对比 年初至今 中证白酒 中证2000")
 
+        # 确保 uid 是列表格式（处理可能的字符串返回值）
+        if isinstance(uid, str):
+            uid = uid.split('_') if uid else []
+        
         uid = convert_list(uid)
         if len(uid) > 12:
             uid = uid[:12]

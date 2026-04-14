@@ -86,6 +86,10 @@ async def draw_my_stock_img(ev: Event):
     if not uid:
         return "您还未添加自选呢~请输入 添加自选 查看帮助!"
 
+    # 确保 uid 是列表格式（处理可能的字符串返回值）
+    if isinstance(uid, str):
+        uid = uid.split('_') if uid else []
+    
     uid = convert_list(uid)
     data_zs = await get_mtdata("主要指数", pz=100)
     data_hy = await get_mtdata("行业板块")
