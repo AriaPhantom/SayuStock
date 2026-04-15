@@ -42,7 +42,12 @@ DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
 
 
 def _need_dc_token(url: str) -> bool:
-    return url.startswith("https://push2.eastmoney.com/api/qt/stock/")
+    return url.startswith(
+        (
+            "https://push2.eastmoney.com/api/qt/stock/",
+            "https://push2his.eastmoney.com/api/qt/stock/",
+        )
+    )
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:

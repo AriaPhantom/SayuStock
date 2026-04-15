@@ -155,3 +155,31 @@ Expected effect:
 - the first Eastmoney stock request may still need one token bootstrap after process start
 - subsequent all-weather requests should avoid the repeated warning burst
 - total render time should drop materially because concurrent requests no longer all launch their own token refresh path
+
+## 2026-04-15 push2his follow-up
+
+Symptoms:
+
+- ll-weather is still much slower than expected even after the first DC-token cache patch
+- logs still show repeated warnings like:
+  - push2his.eastmoney.com/api/qt/stock/trends2/get failed, trying DC-Token
+- US ETF / bond / FX panels spend several extra seconds per symbol
+
+Root cause:
+
+1. the previous patch only treated https://push2.eastmoney.com/api/qt/stock/* as requiring a cached DC token on the first attempt
+2. 	rends2/get and other historical stock endpoints actually live under https://push2his.eastmoney.com/api/qt/stock/*
+3. those requests therefore still sent a token-less first request, failed once, then forced a token refresh / retry
+4. on the VPS this added ~3-4 seconds per push2his request and kept the warning spam alive
+
+Fix in this patch:
+
+- extend the first-attempt cached-token path to both:
+  - https://push2.eastmoney.com/api/qt/stock/*
+  - https://push2his.eastmoney.com/api/qt/stock/*
+
+Expected effect:
+
+- 	rends2/get should stop doing a guaranteed fail-first cycle
+- all-weather commodity / bond / FX sections should speed up materially
+- warning volume in GSUID logs should drop again because cached DC cookies are now reused for both live and historical Eastmoney stock APIs
