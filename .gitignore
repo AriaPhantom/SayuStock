@@ -674,3 +674,13 @@ all_image
 testnb2/
 
 em_data
+
+### Testing & Debugging ###
+test/*.png
+test/vps_*
+test/mock_*
+test/all_weather_*
+test/finalize_promax.py
+test/run_real_data.py
+test/test_*.py
+!test/single_stock_test.py
