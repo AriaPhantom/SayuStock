@@ -15,7 +15,7 @@ from gsuid_core.logger import logger
 
 from .utils import fill_kline
 from .get_compare import to_compare_fig
-from ..utils.image import render_image_by_pw
+from ..utils.image import render_image_by_pw, render_promax_image
 from ..utils.utils import get_vix_name, int_to_percentage, number_to_chinese
 from ..utils.constant import ErroText, bk_dict, market_dict
 from ..utils.time_range import get_trading_minutes
@@ -252,229 +252,135 @@ async def to_single_fig_kline(raw_data: Dict, sp: Optional[str] = None):
 
 # 获取个股图形
 async def to_single_fig(raw_data: Dict):
-    logger.info("[SayuStock] 开始获取图形...")
+    logger.info("[SayuStock] 开始获取图形 (Pro Max Mode)...")
     raw = raw_data["data"]
-    gained: float = raw["f170"]
-    price_histroy = raw_data["trends"]
+    price_history = raw_data["trends"]
     stock_name = raw["f58"]
     new_price = raw["f43"]
-    custom_info = int_to_percentage(gained)
-    turnover_rate = raw["f168"]
-    total_amount = number_to_chinese(raw["f48"]) if isinstance(raw["f48"], float) else 0
+    open_price = raw["f60"]
 
     code_id = raw_data.get("file_name")
-    # 遍历TIME_RANGE如果存在没有数据的时间则插入空数据
     full_data = []
-    existing_times = set(item["datetime"] for item in price_histroy)
+    existing_times = {item["datetime"] for item in price_history}
     ARRAY = get_trading_minutes(code_id)
+    
     for time in ARRAY:
         if time in existing_times:
-            full_data.append(next(item for item in price_histroy if item["datetime"] == time))
+            item = next(it for it in price_history if it["datetime"] == time)
+            full_data.append(item)
         else:
-            full_data.append(
-                {
-                    "datetime": time,
-                    "price": None,
-                    "open": None,
-                    "high": None,
-                    "low": None,
-                    "amount": None,
-                    "money": None,
-                    "avg_price": None,
-                }
-            )
-    price_histroy = full_data
+            full_data.append({"datetime": time, "price": None, "money": 0})
+    
+    df = pd.DataFrame(full_data)
 
-    price_history_pd = pd.DataFrame(
-        {
-            "datetime": [item["datetime"] for item in full_data],
-            "price": [item["price"] for item in full_data],
-            "money": [item["money"] for item in full_data],  # 新增 money 列
-        }
-    )
+    # 颜色配置 (Cyberpunk HUD)
+    up_color = "#00FF00"  # Matrix Green
+    down_color = "#FF3B30"  # Neon Red
+    line_color = "#00FFFF"  # Cyan
+    bg_color = "#000000"  # OLED Black
+    grid_color = "rgba(255, 255, 255, 0.05)"
 
-    # price_history_pd['price'] = price_history_pd['price'].fillna(None)
-
-    # 设置最大波动率
-    open_price = raw["f60"]
-    max_price = price_history_pd["price"].max()
-    min_price = price_history_pd["price"].min()
-    max_fluctuation = max(
-        (max_price - open_price) / open_price,
-        (open_price - min_price) / open_price,
-    )
-    y_axis_max_price = open_price * (1 + max_fluctuation + 0.01)
-    y_axis_min_price = open_price * (1 - max_fluctuation - 0.01)
+    # 计算自适应范围
+    max_price = df["price"].max()
+    min_price = df["price"].min()
+    
+    # 填充缺失值以便计算范围
+    valid_prices = df["price"].dropna()
+    if valid_prices.empty:
+        return ErroText["notOpen"]
+        
+    max_p = valid_prices.max()
+    min_p = valid_prices.min()
+    
+    diff = max(abs(max_p - open_price), abs(min_p - open_price))
+    y_max = open_price + diff * 1.2
+    y_min = open_price - diff * 1.2
 
     fig = make_subplots(
-        rows=2,
-        cols=1,
-        shared_xaxes=True,  # 共享X轴
-        vertical_spacing=0.05,  # 子图间的垂直间距
-        row_heights=[0.7, 0.3],  # 第一行（价格）占70%高度，第二行（量能）占30%
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.02,
+        row_heights=[0.75, 0.25],
     )
 
-    # 1. 添加价格折线图到第一行
+    # 1. 价格面积图 (带渐变效果)
     fig.add_trace(
         go.Scatter(
-            x=price_history_pd["datetime"],
-            y=price_history_pd["price"],
+            x=df["datetime"],
+            y=df["price"],
             mode="lines",
             name="Price",
-            line=dict(width=3, color="white"),
+            line=dict(width=4, color=line_color),
+            fill='tozeroy',
+            fillcolor='rgba(0, 255, 255, 0.1)', # 淡淡的青色填充
             showlegend=False,
         ),
-        row=1,
-        col=1,
+        row=1, col=1,
     )
 
-    # 2. 为量能柱状图生成颜色
-    bar_colors = []
-    prices = price_history_pd["price"]
-
-    if prices[0] is None:
-        return ErroText["notOpen"]
-
-    for i in range(len(prices)):
-        if i == 0:
-            # 第一个数据点，可以与开盘价比较
-            bar_colors.append("red" if prices[i] > open_price else "green")
-        else:
-            # 与前一个数据点比较
-            if prices[i] > prices[i - 1]:
-                bar_colors.append("red")
-            elif prices[i] < prices[i - 1]:
-                bar_colors.append("green")
-            else:
-                bar_colors.append("grey")  # 如果价格不变，使用灰色
-
-    # 3. 添加量能柱状图到第二行
-    fig.add_trace(
-        go.Bar(
-            x=price_history_pd["datetime"],
-            y=price_history_pd["money"],
-            name="Volume",
-            marker_color=bar_colors,  # 应用动态颜色
-            showlegend=False,
-        ),
-        row=2,
-        col=1,
-    )
-
-    # --- 将原有的 Shape 添加到第一个子图中 ---
-    fig.add_hrect(
-        y0=open_price,
-        y1=y_axis_max_price,
-        fillcolor="red",
-        opacity=0.2,
-        layer="below",
-        line_width=0,
-    )
-
-    # 绘制绿色区域 (开盘价之下)
-    fig.add_hrect(
-        y0=y_axis_min_price,
-        y1=open_price,
-        fillcolor="green",
-        opacity=0.2,
-        layer="below",
-        line_width=0,
-    )
-
-    # 使用 add_hline 绘制横跨整个图表宽度的水平线
+    # 2. 开盘价水平线
     fig.add_hline(
         y=open_price,
-        line=dict(color="yellow", width=2, dash="dashdot"),
+        line=dict(color="rgba(255, 215, 0, 0.5)", width=2, dash="dash"),
+        row=1, col=1
     )
 
-    # 计算Y轴刻度
-    tick_values = []
-    tick_texts = []
+    # 3. 量能柱状图
+    bar_colors = []
+    prices = df["price"].tolist()
+    for i in range(len(prices)):
+        if i == 0 or prices[i] is None or prices[i-1] is None:
+            bar_colors.append(up_color if (prices[i] or 0) >= open_price else down_color)
+        else:
+            bar_colors.append(up_color if prices[i] >= prices[i-1] else down_color)
 
-    max_range_percent = max_fluctuation * 100
-    if max_range_percent > 15:
-        step = 2
-    elif max_range_percent > 30:
-        step = 5
-    else:
-        step = 1
-
-    for i in range(
-        int(-(max_fluctuation + 0.01) * 100),
-        int((max_fluctuation + 0.01) * 100) + 1,
-    ):
-        if i % step == 0:
-            price = open_price * (1 + i / 100)
-            if y_axis_min_price <= price <= y_axis_max_price:
-                tick_values.append(price)
-                tick_texts.append(f"{i}%")
-
-    title_str1 = f"{stock_name}  最新价：{new_price}"
-    title_str = f"<b>【{title_str1}】 开盘价：{open_price} 涨跌幅：<span style='color:{'red' if gained >= 0 else 'green'};'>{custom_info}</span> 换手率 {turnover_rate}% 成交额 {total_amount}</b>"  # noqa: E501
-
-    # --- 更新整体布局和坐标轴 ---
-    fig.update_layout(
-        title=dict(
-            text=title_str,
-            font=dict(size=60),
-            y=0.99,
-            x=0.5,
-            xanchor="center",
-            yanchor="top",
+    fig.add_trace(
+        go.Bar(
+            x=df["datetime"],
+            y=df["money"],
+            marker_color=bar_colors,
+            opacity=0.8,
+            showlegend=False,
         ),
-        margin=dict(t=80, l=50, r=50, b=50),
-        paper_bgcolor="black",
-        plot_bgcolor="black",
-        font=dict(color="white", size=40),
-        # 隐藏所有图例
-        showlegend=False,
-        # 移除X轴的滑块
-        # xaxis_rangeslider_visible=False,
+        row=2, col=1,
     )
 
-    # 更新Y轴 (价格)
+    # 布局优化
+    fig.update_layout(
+        margin=dict(t=250, l=80, r=80, b=80), # 为顶部的 PIL HUD 留出空间
+        paper_bgcolor=bg_color,
+        plot_bgcolor=bg_color,
+        font=dict(color="white", size=24),
+    )
+
     fig.update_yaxes(
-        title_text="价格",
-        range=[y_axis_min_price, y_axis_max_price],
+        range=[y_min, y_max],
         showgrid=True,
-        gridcolor="rgba(255,255,255,0.2)",
-        tickvals=tick_values,
-        ticktext=tick_texts,
-        title_font=dict(size=45),
-        tickfont=dict(size=26),
-        row=1,
-        col=1,
+        gridcolor=grid_color,
+        tickfont=dict(size=22),
+        row=1, col=1
     )
 
-    # 更新Y轴 (量能)
     fig.update_yaxes(
-        title_text="量能",
         showgrid=False,
-        title_font=dict(size=45),
-        tickfont=dict(size=26),
-        row=2,
-        col=1,
+        showticklabels=False,
+        row=2, col=1
     )
 
-    # 更新X轴 (隐藏顶部的X轴刻度，只显示底部的)
     fig.update_xaxes(
-        # showticklabels=False,
-        # showgrid=False,
+        showgrid=True,
+        gridcolor=grid_color,
         dtick=60,
-        row=1,
-        col=1,
-        title_font=dict(size=45),
-        tickfont=dict(size=26),
+        tickfont=dict(size=22),
+        row=1, col=1
     )
+    
     fig.update_xaxes(
-        title_text="时间",
-        showgrid=False,
-        dtick=15,  # 每15分钟一个刻度
-        title_font=dict(size=45),
-        tickfont=dict(size=26),
-        row=2,
-        col=1,
+        dtick=30,
+        tickfont=dict(size=22),
+        row=2, col=1
     )
+
     return fig
 
 
@@ -1046,9 +952,34 @@ async def render_image(
         h = 0
         _scale = 0
 
-    return await render_image_by_pw(
+    img = await render_image_by_pw(
         html_path,
         w,
         h,
         _scale,
     )
+    
+    # --- Pro Max 后处理 ---
+    if sector == "single-stock" and isinstance(img, bytes):
+        try:
+            # 解析原始数据用于 HUD 渲染
+            # 注意：这里我们可能需要再次获取数据或者传递数据
+            # 为简单起见，我们假设 html_path 包含我们需要的信息（或者我们可以重构以传递数据）
+            # 由于 render_html 已经完成了数据获取，这里我们重新获取一次（或者从缓存拿）
+            from ..utils.stock.request import get_gg
+            raw_data = await get_gg(market, "single-stock")
+            if isinstance(raw_data, dict):
+                raw = raw_data["data"]
+                img = await render_promax_image(
+                    base_img_bytes=img,
+                    title=raw["f58"],
+                    subtitle=f"{market} | 换手 {raw['f168']}% | 额 {number_to_chinese(raw['f48'])}",
+                    price=str(raw["f43"]),
+                    change_pct=str(raw["f170"]),
+                    is_up=raw["f170"] >= 0,
+                    footer_info=f"SayuStock Pro Max | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+        except Exception as e:
+            logger.error(f"[SayuStock] Pro Max 后处理失败: {e}")
+
+    return img

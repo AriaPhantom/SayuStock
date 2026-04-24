@@ -1,15 +1,16 @@
 import random
 import asyncio
+from datetime import datetime
 from typing import Any, Dict, List, Union, Callable, Optional
 from pathlib import Path
 
-from PIL import Image
-
+from PIL import Image, ImageDraw, ImageFont
+from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
 
 from .draw_info import draw_block
 from .get_jp_data import get_jpy
-from ..utils.image import get_footer
+from ..utils.image import get_footer, draw_glass_card
 from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
 from ..utils.constant import bond, whsc, i_code, commodity
 from ..utils.stock.request import get_gg, get_mtdata
@@ -75,17 +76,29 @@ async def draw_future_img():
     data4: DataLike = safe_data(results[2])
     data5: DataLike = safe_data(results[3])
 
-    img = Image.open(TEXT_PATH / "bg1.jpg").convert("RGBA")
-    ox = 223
-    oy = 140
+    # --- V3 Data-First Background ---
+    w, h = 900, 2200 
+    img = Image.new("RGBA", (w, h), (7, 8, 12, 255)) 
+    draw = ImageDraw.Draw(img)
+
+    # 1. 紧凑型顶部状态 (移除时间线)
+    draw.rectangle([0, 0, w, 80], fill=(20, 21, 26, 255))
+    draw.text((40, 40), "// GLOBAL MARKET REAL-TIME MONITOR", (0, 255, 255, 200), font=ss_font(28), anchor="lm")
+    draw.text((w-40, 40), f"STATUS: ACTIVE | {datetime.now().strftime('%H:%M:%S')}", (100, 100, 120), font=ss_font(18), anchor="rm")
+    
+    ox = 210
+    oy = 125
     data_gz: List[Dict] = data1["data"]["diff"]
 
-    async def paste_blocks(data_list: DataLike, keys, y_base, block_type=None):
+    async def paste_blocks(data_list: DataLike, keys, y_base, title, accent_color, block_type=None):
         if data_list is None:
             return
+        
+        # 极简精密标题
+        draw.rectangle([40, y_base - 30, 45, y_base - 10], fill=accent_color)
+        draw.text((60, y_base - 20), f"{title}", (180, 180, 190), font=ss_font(22), anchor="lm")
 
         index = 0
-        # 统一迭代：支持 dict.values() 或 list
         items = data_list.values() if isinstance(data_list, dict) else data_list
         for d in keys:
             for item in items:
@@ -95,19 +108,21 @@ async def draw_future_img():
                 block = await draw_block(item, block_type) if block_type else await draw_block(item)
                 img.paste(
                     block,
-                    (62 + ox * (index % 4), y_base + oy * (index // 4)),
+                    (40 + ox * (index % 4), y_base + 10 + oy * (index // 4)),
                     block,
                 )
                 index += 1
 
-    # 绘制各板块
-    await paste_blocks(data_gz, i_code, 487)
-    await paste_blocks(data2, commodity, 1007, "single")
-    await paste_blocks(data3, bond, 1395, "single")
-    await paste_blocks(data4, whsc, 1773, "single")
-    await paste_blocks(data5, CRYPTO_MAP, 1988, "single")
+    # 绘制各板块 (移除时间线后的新布局坐标)
+    await paste_blocks(data_gz, i_code, 150, "GLOBAL INDICES", (239, 68, 68))
+    await paste_blocks(data2, commodity, 680, "COMMODITIES", (168, 85, 247), "single")
+    await paste_blocks(data3, bond, 1100, "BONDS & YIELDS", (234, 179, 8), "single")
+    await paste_blocks(data4, whsc, 1520, "FOREX", (20, 184, 166), "single")
+    await paste_blocks(data5, CRYPTO_MAP, 1820, "CRYPTO", (249, 115, 22), "single")
 
+    # 页脚
     footer = get_footer()
-    img.paste(footer, (75, 2135), footer)
+    img.paste(footer, (w//2 - footer.width//2, h - 80), footer)
+
     res = await convert_img(img)
     return res

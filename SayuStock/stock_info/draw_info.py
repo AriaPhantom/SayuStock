@@ -112,55 +112,73 @@ async def draw_block(zs_diff: Dict, _type: str = "diff"):
         zs_diff["f2"] = zs_diff["f43"]
         zs_diff["f100"] = "-"
 
-    if isinstance(zs_diff["f3"], str):
-        diff: float = 0
-    else:
-        diff = round(zs_diff["f3"], 2)
+    diff_val = zs_diff.get("f3", 0)
+    if isinstance(diff_val, (str, type(None))):
+        diff_val = 0
+    diff = round(float(diff_val), 2)
 
-    zs_img = Image.new("RGBA", (200, 140))
+    # 紧凑型 Block 尺寸 (V3 Data-Rich)
+    w, h = 210, 115 
+    zs_img = Image.new("RGBA", (w, h))
     zs_draw = ImageDraw.Draw(zs_img)
-    if diff >= 0:
-        zsc = calculate_gradient_rgb_from_gray(diff)
-        zsc2 = (206, 34, 30)
+
+    # 颜色与强度计算
+    is_up = diff >= 0
+    intensity = min(abs(diff) / 5.0, 1.0) # 5% 涨跌即满强度
+    if is_up:
+        base_color = (34, 197, 94)
+        glow_color = (34, 197, 94, int(40 * intensity))
     else:
-        zsc = calculate_gradient_rgb_from_gray(diff)
-        zsc2 = (36, 206, 30)
+        base_color = (239, 68, 68)
+        glow_color = (239, 68, 68, int(40 * intensity))
+        
+    accent_color = (*base_color, 255)
+    glass_bg = (15, 16, 22, 240) 
 
-    zs_draw.rounded_rectangle((15, 13, 185, 127), 0, zsc)
+    # 1. 绘制背景与强度发光
+    zs_draw.rounded_rectangle([2, 2, w-2, h-2], radius=4, fill=glow_color)
+    zs_draw.rounded_rectangle([5, 5, w-5, h-5], radius=4, fill=glass_bg, outline=(255,255,255,20), width=1)
+    
+    # 顶部装饰线
+    zs_draw.rectangle([5, 5, w-5, 8], fill=accent_color)
 
-    t_font = ss_font(24)
+    # 字体
+    try:
+        f_name = ss_font(20)
+        f_price = ss_font(24)
+        f_diff = ss_font(18)
+        f_meta = ss_font(14)
+    except:
+        f_name = f_price = f_diff = f_meta = ImageFont.load_default()
 
-    if len(zs_diff["f14"]) >= 15:
-        name = zs_diff["f14"][:6]
+    name = zs_diff["f14"]
+    if len(name) > 8: name = name[:7] + "."
+    
+    code = str(zs_diff.get("f12", ""))
+    price = str(zs_diff.get("f2", "-"))
+    amount = zs_diff.get("f6", "-")
+    if isinstance(amount, (int, float)):
+        amount_str = number_to_chinese(amount)
     else:
-        if len(zs_diff["f14"]) >= 10:
-            t_font = ss_font(18)
+        amount_str = str(amount)
 
-        name = zs_diff["f14"]
+    # 2. 布局数据
+    # 价格 (大)
+    zs_draw.text((w//2, 32), price, accent_color, font=f_price, anchor="mm")
+    
+    # 涨跌幅 (带符号)
+    diff_str = f"{'+' if is_up else ''}{diff}%"
+    zs_draw.text((w//2, 58), diff_str, accent_color, font=f_diff, anchor="mm")
+    
+    # 成交额 (新加)
+    if amount_str != "-":
+        zs_draw.text((w//2, 78), f"额 {amount_str}", (120, 120, 130), font=f_meta, anchor="mm")
+    
+    # 底部名称与代码
+    zs_draw.text((w//2, 98), name, (200, 200, 200), font=f_name, anchor="mm")
+    if code and code != "None":
+        zs_draw.text((w-10, h-15), code, (80, 80, 80), font=f_meta, anchor="rm")
 
-    zs_draw.text(
-        (100, 99),
-        name,
-        (255, 255, 255),
-        t_font,
-        "mm",
-    )
-
-    zs_draw.text(
-        (100, 38),
-        f"{zs_diff['f2']}",
-        zsc2,
-        ss_font(30),
-        "mm",
-    )
-
-    zs_draw.text(
-        (100, 70),
-        f"{'+' if diff >= 0 else ''}{diff}%",
-        zsc2,
-        ss_font(30),
-        "mm",
-    )
     return zs_img
 
 
