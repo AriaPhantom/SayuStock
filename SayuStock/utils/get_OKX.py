@@ -61,6 +61,8 @@ FREQ_TO_SECONDS = {
     "1Y": 31556952,  # 约365.24天
 }
 
+LAST_OKX_ERROR_TIME = datetime.datetime.min
+
 # 币种名称到 OKX API instId 的映射
 CRYPTO_MAP = {
     "BTC USD": "BTC-USD",
@@ -686,11 +688,23 @@ async def get_price_and_change_simple(
             except Exception as e:
                 if isinstance(e, httpx.HTTPError):
                     last_error = e
-                logger.warning(f"OKX request via {proxy or 'direct'} failed: {e}")
+                
+                now = datetime.datetime.now()
+                global LAST_OKX_ERROR_TIME
+                if (now - LAST_OKX_ERROR_TIME).total_seconds() > 300:
+                    logger.warning(f"OKX request via {proxy or 'direct'} failed (cooldown): {e}")
+                    LAST_OKX_ERROR_TIME = now
 
         if last_error is not None:
-            logger.error(f"网络请求错误: {last_error}")
+            now = datetime.datetime.now()
+            if (now - LAST_OKX_ERROR_TIME).total_seconds() > 300:
+                logger.error(f"网络请求错误 (cooldown): {last_error}")
+                LAST_OKX_ERROR_TIME = now
         return None
     except (KeyError, IndexError, ValueError) as e:
-        logger.error(f"解析或计算数据时出错: {e}")
+        now = datetime.datetime.now()
+        global LAST_OKX_ERROR_TIME
+        if (now - LAST_OKX_ERROR_TIME).total_seconds() > 300:
+            logger.error(f"解析或计算数据时出错 (冷却中): {e}")
+            LAST_OKX_ERROR_TIME = now
         return None

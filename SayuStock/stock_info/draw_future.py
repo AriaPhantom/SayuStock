@@ -77,7 +77,7 @@ async def draw_future_img():
     data5: DataLike = safe_data(results[3])
 
     # --- V3 Data-First Background ---
-    w, h = 900, 2200 
+    w, h = 900, 2800 
     img = Image.new("RGBA", (w, h), (7, 8, 12, 255)) 
     draw = ImageDraw.Draw(img)
 
@@ -103,7 +103,9 @@ async def draw_future_img():
         for d in keys:
             for item in items:
                 name = item.get("f58", item.get("f14"))
-                if name != d:
+                # 兼容性处理：如果 item 是个股数据，f58 可能包含板块信息，如 "上证指数 (指数)"
+                pure_name = name.split(" (")[0]
+                if pure_name != d:
                     continue
                 block = await draw_block(item, block_type) if block_type else await draw_block(item)
                 img.paste(
@@ -115,10 +117,10 @@ async def draw_future_img():
 
     # 绘制各板块 (移除时间线后的新布局坐标)
     await paste_blocks(data_gz, i_code, 150, "GLOBAL INDICES", (239, 68, 68))
-    await paste_blocks(data2, commodity, 680, "COMMODITIES", (168, 85, 247), "single")
-    await paste_blocks(data3, bond, 1100, "BONDS & YIELDS", (234, 179, 8), "single")
-    await paste_blocks(data4, whsc, 1520, "FOREX", (20, 184, 166), "single")
-    await paste_blocks(data5, CRYPTO_MAP, 1820, "CRYPTO", (249, 115, 22), "single")
+    await paste_blocks(data2, commodity, 750, "COMMODITIES", (168, 85, 247), "single")
+    await paste_blocks(data3, bond, 1150, "BONDS & YIELDS", (234, 179, 8), "single")
+    await paste_blocks(data4, whsc, 1600, "FOREX", (20, 184, 166), "single")
+    await paste_blocks(data5, CRYPTO_MAP, 2050, "CRYPTO", (249, 115, 22), "single")
 
     # 页脚
     footer = get_footer()

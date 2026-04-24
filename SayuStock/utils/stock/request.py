@@ -37,6 +37,7 @@ from .request_utils import get_code_id
 
 MENU_CACHE = {}
 DC_TOKEN = ""
+LAST_DC_REFRESH = datetime.min
 NOW_QUEUE = 0
 DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
 
@@ -583,13 +584,26 @@ async def get_dc_token(force_refresh: bool = False):
     if DC_TOKEN_LOCK is None:
         DC_TOKEN_LOCK = asyncio.Lock()
 
+    # 如果 token 存在且不是强制刷新，直接返回
+    if DC_TOKEN and not force_refresh:
+        return DC_TOKEN
+
     async with DC_TOKEN_LOCK:
+        # 双重检查
         if DC_TOKEN and not force_refresh:
+            return DC_TOKEN
+
+        # 冷却检查：5分钟内不重复刷新
+        now = datetime.now()
+        if DC_TOKEN and (now - LAST_DC_REFRESH).total_seconds() < 300:
+            logger.info("[SayuStock] DC-Token 刷新冷却中，使用旧 Token。")
             return DC_TOKEN
 
         token = await _fetch_dc_token()
         if token:
             DC_TOKEN = token
+            global LAST_DC_REFRESH
+            LAST_DC_REFRESH = now
         return DC_TOKEN
 
 
