@@ -38,6 +38,7 @@ from .request_utils import get_code_id
 MENU_CACHE = {}
 DC_TOKEN = ""
 LAST_DC_REFRESH = datetime.min
+LAST_DC_FAILURE = datetime.min
 NOW_QUEUE = 0
 DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
 
@@ -599,11 +600,20 @@ async def get_dc_token(force_refresh: bool = False):
             logger.info("[SayuStock] DC-Token 刷新冷却中，使用旧 Token。")
             return DC_TOKEN
 
+        # 失败熔断：如果最近一次失败在 2 分钟内，不再尝试，避免阻塞
+        global LAST_DC_FAILURE
+        if (now - LAST_DC_FAILURE).total_seconds() < 120:
+            logger.warning("[SayuStock] DC-Token 最近刷新失败，熔断中，跳过浏览器启动。")
+            return DC_TOKEN
+
         token = await _fetch_dc_token()
         if token:
             DC_TOKEN = token
             global LAST_DC_REFRESH
             LAST_DC_REFRESH = now
+        else:
+            LAST_DC_FAILURE = now
+            logger.error("[SayuStock] DC-Token 获取失败，进入 2 分钟熔断期。")
         return DC_TOKEN
 
 
@@ -651,7 +661,7 @@ async def _fetch_dc_token():
             await page.goto(
                 "https://www.eastmoney.com/",
                 wait_until="domcontentloaded",
-                timeout=20000,
+                timeout=15000,
             )
             await page.wait_for_timeout(1500)
             cookies = await context.cookies()

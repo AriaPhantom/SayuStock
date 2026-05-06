@@ -115,16 +115,64 @@ async def draw_future_img():
                 )
                 index += 1
 
-    # 绘制各板块 (移除时间线后的新布局坐标)
-    await paste_blocks(data_gz, i_code, 150, "GLOBAL INDICES", (239, 68, 68))
-    await paste_blocks(data2, commodity, 750, "COMMODITIES", (168, 85, 247), "single")
-    await paste_blocks(data3, bond, 1150, "BONDS & YIELDS", (234, 179, 8), "single")
-    await paste_blocks(data4, whsc, 1600, "FOREX", (20, 184, 166), "single")
-    await paste_blocks(data5, CRYPTO_MAP, 2050, "CRYPTO", (249, 115, 22), "single")
+    # 绘制各板块 (流式布局，避免空白)
+    curr_y = 150
+    sections = [
+        (data_gz, i_code, "GLOBAL INDICES", (239, 68, 68), None),
+        (data2, commodity, "COMMODITIES", (168, 85, 247), "single"),
+        (data3, bond, "BONDS & YIELDS", (234, 179, 8), "single"),
+        (data4, whsc, "FOREX", (20, 184, 166), "single"),
+        (data5, CRYPTO_MAP, "CRYPTO", (249, 115, 22), "single"),
+    ]
 
-    # 页脚
+    async def paste_blocks_dynamic(data_list: DataLike, keys, y_start, title, accent_color, block_type=None):
+        if not data_list:
+            return 0
+        
+        # 预检查是否有实际内容
+        items = data_list.values() if isinstance(data_list, dict) else data_list
+        valid_items = []
+        for d in keys:
+            for item in items:
+                name = item.get("f58", item.get("f14"))
+                pure_name = name.split(" (")[0]
+                if pure_name == d:
+                    valid_items.append(item)
+                    break
+        
+        if not valid_items:
+            return 0
+
+        # 绘制标题
+        draw.rectangle([40, y_start - 30, 45, y_start - 10], fill=accent_color)
+        draw.text((60, y_start - 20), f"{title}", (180, 180, 190), font=ss_font(22), anchor="lm")
+
+        index = 0
+        for item in valid_items:
+            block = await draw_block(item, block_type) if block_type else await draw_block(item)
+            img.paste(
+                block,
+                (40 + ox * (index % 4), y_start + 10 + oy * (index // 4)),
+                block,
+            )
+            index += 1
+        
+        # 返回占用的高度
+        rows = (index + 3) // 4
+        return rows * oy + 60
+
+    for d_list, keys, title, color, b_type in sections:
+        height_used = await paste_blocks_dynamic(d_list, keys, curr_y, title, color, b_type)
+        if height_used > 0:
+            curr_y += height_used + 40 # 加上间距
+
+    # 页脚 (动态位置)
     footer = get_footer()
-    img.paste(footer, (w//2 - footer.width//2, h - 80), footer)
+    img.paste(footer, (w//2 - footer.width//2, curr_y + 20), footer)
+
+    # 裁剪图片，去除底部多余空白
+    final_h = min(curr_y + 120, h)
+    img = img.crop((0, 0, w, final_h))
 
     res = await convert_img(img)
     return res
