@@ -54,8 +54,8 @@ async def append_jpy(result: Dict):
 
 async def draw_future_img():
     data1 = await get_mtdata("国际市场")
-    if isinstance(data1, str):
-        return data1
+    if not isinstance(data1, dict):
+        return str(data1)
 
     # 并发获取数据
     results = await asyncio.gather(
@@ -90,30 +90,6 @@ async def draw_future_img():
     oy = 125
     data_gz: List[Dict] = data1["data"]["diff"]
 
-    async def paste_blocks(data_list: DataLike, keys, y_base, title, accent_color, block_type=None):
-        if data_list is None:
-            return
-        
-        # 极简精密标题
-        draw.rectangle([40, y_base - 30, 45, y_base - 10], fill=accent_color)
-        draw.text((60, y_base - 20), f"{title}", (180, 180, 190), font=ss_font(22), anchor="lm")
-
-        index = 0
-        items = data_list.values() if isinstance(data_list, dict) else data_list
-        for d in keys:
-            for item in items:
-                name = item.get("f58", item.get("f14"))
-                # 兼容性处理：如果 item 是个股数据，f58 可能包含板块信息，如 "上证指数 (指数)"
-                pure_name = name.split(" (")[0]
-                if pure_name != d:
-                    continue
-                block = await draw_block(item, block_type) if block_type else await draw_block(item)
-                img.paste(
-                    block,
-                    (40 + ox * (index % 4), y_base + 10 + oy * (index // 4)),
-                    block,
-                )
-                index += 1
 
     # 绘制各板块 (流式布局，避免空白)
     curr_y = 150
