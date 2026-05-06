@@ -216,7 +216,7 @@ Fixes in this patch:
 
 - persist the Eastmoney DC cookie header to `dc_token.json` under the SayuStock resource root
 - load the persisted DC token before starting Playwright, and only launch Playwright when no valid persisted token exists or an actual 403 forces refresh
-- bypass the 5-minute success cooldown for `force_refresh=True` so a real 403 can replace a bad persisted token immediately
+- let the first real 403 replace a bad persisted token, but coalesce concurrent 403 refreshes so only one coroutine starts Playwright in a burst
 - coalesce concurrent `async_file_cache` misses per cache file so simultaneous commands do not stampede the same Eastmoney endpoint
 - add a 20-second in-process `draw_future_img()` result cache/lock for repeated group spam; this is not a scheduler and sends no background Eastmoney requests
 
@@ -225,6 +225,13 @@ Validation:
 - `python -m py_compile SayuStock/utils/stock/request.py SayuStock/utils/stock/utils.py SayuStock/stock_info/draw_future.py`
 - local draw simulation with stubbed gsuid runtime returned image size `900x1395`; first render `1.0189s`, second in-process cache hit `0.000008s`
 
+
+Follow-up from VPS validation:
+
+- real VPS draw validation showed that unbounded `force_refresh=True` could still cause a Playwright refresh burst when many concurrent symbol requests all received 403
+- `get_dc_token(force_refresh=True, current_token=...)` now detects when another coroutine has already replaced the token, and also applies a short force-refresh cooldown after a browser refresh
+- this keeps the no-polling design while avoiding a 403-triggered token refresh stampede
+
 Operational note:
 
-- production deploy still requires an interactive/credentialed SSH path; batch SSH from this desktop failed with publickey/password denial
+- normal VPS `git fetch` from GitHub timed out from the server network; production was hot-deployed by SFTP after local commit/push, then `systemctl restart gsuid` and journal checks were run

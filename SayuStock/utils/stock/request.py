@@ -46,6 +46,7 @@ DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
 DC_TOKEN_FILE = MAIN_PATH / "dc_token.json"
 DC_TOKEN_EXPIRE_FALLBACK = timedelta(days=7)
 DC_TOKEN_EXPIRE_SAFETY = timedelta(minutes=5)
+DC_FORCE_REFRESH_COOLDOWN = timedelta(seconds=60)
 
 
 def _need_dc_token(url: str) -> bool:
@@ -611,6 +612,7 @@ async def stock_request(
             await asyncio.sleep(random.uniform(0.4, 0.9))
 
         for _ in range(2):
+            used_cookie = ""
             try:
                 NOW_QUEUE += 1
                 request_headers = dict(base_header)
@@ -620,6 +622,7 @@ async def stock_request(
                     cached_cookie = await get_dc_token()
                     if cached_cookie:
                         request_headers["Cookie"] = cached_cookie
+                used_cookie = request_headers.get("Cookie", "")
                 async with client.request(
                     method,
                     url=final_url,
@@ -644,7 +647,7 @@ async def stock_request(
                     return raw_data
             except ServerDisconnectedError:
                 logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                retry_cookie = await get_dc_token(force_refresh=True)
+                retry_cookie = await get_dc_token(force_refresh=True, current_token=used_cookie)
                 await asyncio.sleep(random.uniform(0.2, 0.9))
             finally:
                 NOW_QUEUE -= 1
@@ -652,7 +655,7 @@ async def stock_request(
             return -400016
 
 
-async def get_dc_token(force_refresh: bool = False):
+async def get_dc_token(force_refresh: bool = False, current_token: str = ""):
     global DC_TOKEN, DC_TOKEN_LOCK, LAST_DC_REFRESH, LAST_DC_FAILURE
 
     if DC_TOKEN and not force_refresh:
@@ -671,16 +674,23 @@ async def get_dc_token(force_refresh: bool = False):
             return DC_TOKEN
 
         now = datetime.now()
+        if force_refresh and current_token and DC_TOKEN and DC_TOKEN != current_token:
+            logger.info("[SayuStock] DC-Token 已被其它协程刷新，复用新 Token。")
+            return DC_TOKEN
+
         if not force_refresh:
             persisted_token = await _load_persisted_dc_token()
             if persisted_token:
                 DC_TOKEN = persisted_token
-                LAST_DC_REFRESH = now
                 return DC_TOKEN
 
         # 冷却检查：5分钟内不重复刷新
         if not force_refresh and DC_TOKEN and (now - LAST_DC_REFRESH).total_seconds() < 300:
             logger.info("[SayuStock] DC-Token 刷新冷却中，使用旧 Token。")
+            return DC_TOKEN
+
+        if force_refresh and DC_TOKEN and now - LAST_DC_REFRESH < DC_FORCE_REFRESH_COOLDOWN:
+            logger.info("[SayuStock] DC-Token 强制刷新冷却中，复用刚刷新的 Token。")
             return DC_TOKEN
 
         # 失败熔断：如果最近一次失败在 2 分钟内，不再尝试，避免阻塞
