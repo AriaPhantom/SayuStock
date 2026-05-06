@@ -231,6 +231,8 @@ Follow-up from VPS validation:
 - real VPS draw validation showed that unbounded `force_refresh=True` could still cause a Playwright refresh burst when many concurrent symbol requests all received 403
 - `get_dc_token(force_refresh=True, current_token=...)` now detects when another coroutine has already replaced the token, and also applies a short force-refresh cooldown after a browser refresh
 - this keeps the no-polling design while avoiding a 403-triggered token refresh stampede
+- VPS synthetic concurrency validation: 12 concurrent `force_refresh=True` calls with the same stale token performed exactly 1 fake browser fetch, then reused the refreshed token during the cooldown
+- VPS service validation: `systemctl restart gsuid` completed, `systemctl is-active gsuid` returned `active`, and SayuStock loaded successfully in `journalctl`
 
 Operational note:
 
