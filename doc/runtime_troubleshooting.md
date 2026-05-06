@@ -1,4 +1,4 @@
-# Runtime troubleshooting
+﻿# Runtime troubleshooting
 
 ## Optional torch / Kronos runtime
 
@@ -204,3 +204,27 @@ Fix in this patch:
 Verification:
 
 - `python -m py_compile SayuStock/utils/stock/request.py`
+
+## 2026-05-06 all-weather acceleration: no active polling
+
+Decision:
+
+- do **not** add minute-level scheduled preloading for Eastmoney endpoints
+- acceleration must not create background request pressure that can trip Eastmoney risk controls
+
+Fixes in this patch:
+
+- persist the Eastmoney DC cookie header to `dc_token.json` under the SayuStock resource root
+- load the persisted DC token before starting Playwright, and only launch Playwright when no valid persisted token exists or an actual 403 forces refresh
+- bypass the 5-minute success cooldown for `force_refresh=True` so a real 403 can replace a bad persisted token immediately
+- coalesce concurrent `async_file_cache` misses per cache file so simultaneous commands do not stampede the same Eastmoney endpoint
+- add a 20-second in-process `draw_future_img()` result cache/lock for repeated group spam; this is not a scheduler and sends no background Eastmoney requests
+
+Validation:
+
+- `python -m py_compile SayuStock/utils/stock/request.py SayuStock/utils/stock/utils.py SayuStock/stock_info/draw_future.py`
+- local draw simulation with stubbed gsuid runtime returned image size `900x1395`; first render `1.0189s`, second in-process cache hit `0.000008s`
+
+Operational note:
+
+- production deploy still requires an interactive/credentialed SSH path; batch SSH from this desktop failed with publickey/password denial

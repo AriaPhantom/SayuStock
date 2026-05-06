@@ -4,6 +4,7 @@ import asyncio
 from typing import Any, Dict, List, Tuple, Union, Literal, Optional
 from datetime import datetime, timedelta
 
+import aiofiles
 from yarl import URL
 from aiohttp import (
     FormData,
@@ -34,6 +35,7 @@ from ..constant import (
 )
 from ..load_data import get_full_security_code
 from .request_utils import get_code_id
+from ..resource_path import MAIN_PATH
 
 MENU_CACHE = {}
 DC_TOKEN = ""
@@ -41,6 +43,9 @@ LAST_DC_REFRESH = datetime.min
 LAST_DC_FAILURE = datetime.min
 NOW_QUEUE = 0
 DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
+DC_TOKEN_FILE = MAIN_PATH / "dc_token.json"
+DC_TOKEN_EXPIRE_FALLBACK = timedelta(days=7)
+DC_TOKEN_EXPIRE_SAFETY = timedelta(minutes=5)
 
 
 def _need_dc_token(url: str) -> bool:
@@ -50,6 +55,77 @@ def _need_dc_token(url: str) -> bool:
             "https://push2his.eastmoney.com/api/qt/stock/",
         )
     )
+
+
+def _parse_dc_token_expire(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+
+    try:
+        expire_at = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+    if expire_at.tzinfo is not None:
+        expire_at = expire_at.astimezone().replace(tzinfo=None)
+    return expire_at
+
+
+def _get_cookie_expire(cookies: List[Dict[str, Any]]) -> datetime:
+    expire_times = []
+    for cookie in cookies:
+        raw_expire = cookie.get("expires")
+        if isinstance(raw_expire, (int, float)) and raw_expire > 0:
+            try:
+                expire_times.append(datetime.fromtimestamp(raw_expire))
+            except (OverflowError, OSError, ValueError):
+                continue
+
+    if expire_times:
+        return max(expire_times)
+    return datetime.now() + DC_TOKEN_EXPIRE_FALLBACK
+
+
+async def _load_persisted_dc_token() -> str:
+    if not DC_TOKEN_FILE.exists():
+        return ""
+
+    try:
+        async with aiofiles.open(DC_TOKEN_FILE, mode="r", encoding="utf-8") as f:
+            content = await f.read()
+        payload = json.loads(content)
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning(f"[SayuStock] 读取持久化 DC-Token 失败: {e}")
+        return ""
+
+    token = payload.get("cookie", "")
+    expire_at = _parse_dc_token_expire(payload.get("expire_at"))
+    if not token or expire_at is None:
+        return ""
+
+    if expire_at - datetime.now() <= DC_TOKEN_EXPIRE_SAFETY:
+        logger.info("[SayuStock] 持久化 DC-Token 已过期或接近过期，跳过使用。")
+        return ""
+
+    logger.info("[SayuStock] 命中持久化 DC-Token，跳过 Playwright 启动。")
+    return token
+
+
+async def _save_persisted_dc_token(token: str, expire_at: datetime) -> None:
+    if not token:
+        return
+
+    payload = {
+        "cookie": token,
+        "expire_at": expire_at.isoformat(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        async with aiofiles.open(DC_TOKEN_FILE, mode="w", encoding="utf-8") as f:
+            await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
+        logger.info(f"[SayuStock] DC-Token 已持久化至 {DC_TOKEN_FILE}")
+    except OSError as e:
+        logger.warning(f"[SayuStock] 写入持久化 DC-Token 失败: {e}")
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
@@ -594,9 +670,16 @@ async def get_dc_token(force_refresh: bool = False):
         if DC_TOKEN and not force_refresh:
             return DC_TOKEN
 
-        # 冷却检查：5分钟内不重复刷新
         now = datetime.now()
-        if DC_TOKEN and (now - LAST_DC_REFRESH).total_seconds() < 300:
+        if not force_refresh:
+            persisted_token = await _load_persisted_dc_token()
+            if persisted_token:
+                DC_TOKEN = persisted_token
+                LAST_DC_REFRESH = now
+                return DC_TOKEN
+
+        # 冷却检查：5分钟内不重复刷新
+        if not force_refresh and DC_TOKEN and (now - LAST_DC_REFRESH).total_seconds() < 300:
             logger.info("[SayuStock] DC-Token 刷新冷却中，使用旧 Token。")
             return DC_TOKEN
 
@@ -645,7 +728,8 @@ async def _fetch_dc_token():
                 )
             except Exception as e:
                 logger.error(
-                    f"[SayuStock] Chromium install/relaunch failed. Run `playwright install` manually if needed. Error: {e}"
+                    "[SayuStock] Chromium install/relaunch failed. "
+                    f"Run `playwright install` manually if needed. Error: {e}"
                 )
                 return ""
 
@@ -666,6 +750,8 @@ async def _fetch_dc_token():
             logger.debug(f"[SayuStock] DC cookies fetched: {cookies}")
             cl = [f"{cookie['name']}={cookie['value']}" for cookie in cookies]  # type: ignore # noqa: E501
             DC_TOKEN = ";".join(cl)
+            expire_at = _get_cookie_expire(cookies)  # type: ignore[arg-type]
+            await _save_persisted_dc_token(DC_TOKEN, expire_at)
             logger.debug(f"[SayuStock] DC cookie header set: {DC_TOKEN}")
             return DC_TOKEN
         except Exception as e:

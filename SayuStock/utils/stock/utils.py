@@ -1,7 +1,8 @@
 import json
+import asyncio
 import inspect
 import functools
-from typing import Any, List, Tuple, Callable, Optional, Coroutine
+from typing import Any, Dict, List, Tuple, Callable, Optional, Coroutine
 from datetime import datetime, timedelta
 
 import aiofiles
@@ -11,6 +12,40 @@ from gsuid_core.logger import logger
 
 from ..resource_path import DATA_PATH
 from ...stock_config.stock_config import STOCK_CONFIG
+
+_CACHE_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _get_cache_lock(cache_key: str) -> asyncio.Lock:
+    lock = _CACHE_LOCKS.get(cache_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CACHE_LOCKS[cache_key] = lock
+    return lock
+
+
+async def _read_fresh_cache(file_path: Any, minutes: int) -> Tuple[bool, Any]:
+    if not file_path.exists():
+        return False, None
+
+    try:
+        file_mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+        if datetime.now() - file_mod_time >= timedelta(minutes=minutes):
+            return False, None
+
+        logger.info(f"[SayuStock] json文件在{minutes}分钟内，直接返回文件数据。")
+
+        if file_path.suffix == ".html":
+            return True, file_path
+
+        async with aiofiles.open(file_path, mode="r", encoding="utf-8") as f:
+            logger.success(f"✅ [SayuStock] 缓存命中！正在从 {file_path} 读取...")
+            content = await f.read()
+            return True, json.loads(content)
+
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"🚨 [SayuStock] 读取或解析缓存文件失败: {e}。将重新执行函数。")
+        return False, None
 
 
 def async_file_cache(**get_file_args: Any) -> Callable:
@@ -66,49 +101,41 @@ def async_file_cache(**get_file_args: Any) -> Callable:
             file_path = get_file(**resolved_get_file_args)
             logger.info(f"🔍️ [SayuStock] 检查缓存文件: {file_path}")
 
-            if file_path.exists():
+            if minutes == 0:
+                minutes = STOCK_CONFIG.get_config("mapcloud_refresh_minutes").data
+
+            cache_hit, cached_result = await _read_fresh_cache(file_path, minutes)
+            if cache_hit:
+                return cached_result
+
+            cache_key = str(file_path)
+            async with _get_cache_lock(cache_key):
+                cache_hit, cached_result = await _read_fresh_cache(file_path, minutes)
+                if cache_hit:
+                    return cached_result
+
+                # 5. 如果文件不存在，执行原函数
+                logger.info(f"🚧 [SayuStock] 缓存未命中。正在执行函数 {func.__name__}...")
+                result = await func(*args, **kwargs)
+                if isinstance(result, (int, str)):
+                    return result
+
+                if isinstance(result, Figure):
+                    result.write_html(file_path)
+                    return file_path
+
+                result["file_name"] = file_path.name
+
+                # 6. 将结果异步写入文件
                 try:
-                    # 检查文件的修改时间是否在一分钟以内
-                    if minutes == 0:
-                        minutes: int = STOCK_CONFIG.get_config("mapcloud_refresh_minutes").data
+                    serialized_result = json.dumps(result, indent=4, ensure_ascii=False)
+                    async with aiofiles.open(file_path, mode="w", encoding="utf-8") as f:
+                        await f.write(serialized_result)
+                        logger.success(f"✅ [SayuStock] 结果已成功缓存至 {file_path}")
+                except (TypeError, IOError) as e:
+                    logger.warning(f"🚨 [SayuStock] 缓存结果失败: {e}")
 
-                    file_mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
-                    if datetime.now() - file_mod_time < timedelta(minutes=minutes):
-                        logger.info(f"[SayuStock] json文件在{minutes}分钟内，直接返回文件数据。")
-
-                        if file_path.suffix == ".html":
-                            return file_path
-
-                        async with aiofiles.open(file_path, mode="r", encoding="utf-8") as f:
-                            logger.success(f"✅ [SayuStock] 缓存命中！正在从 {file_path} 读取...")
-                            content = await f.read()
-                            return json.loads(content)
-
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.warning(f"🚨 [SayuStock] 读取或解析缓存文件失败: {e}。将重新执行函数。")
-
-            # 5. 如果文件不存在，执行原函数
-            logger.info(f"🚧 [SayuStock] 缓存未命中。正在执行函数 {func.__name__}...")
-            result = await func(*args, **kwargs)
-            if isinstance(result, (int, str)):
                 return result
-
-            if isinstance(result, Figure):
-                result.write_html(file_path)
-                return file_path
-
-            result["file_name"] = file_path.name
-
-            # 6. 将结果异步写入文件
-            try:
-                serialized_result = json.dumps(result, indent=4, ensure_ascii=False)
-                async with aiofiles.open(file_path, mode="w", encoding="utf-8") as f:
-                    await f.write(serialized_result)
-                    logger.success(f"✅ [SayuStock] 结果已成功缓存至 {file_path}")
-            except (TypeError, IOError) as e:
-                logger.warning(f"🚨 [SayuStock] 缓存结果失败: {e}")
-
-            return result
 
         return wrapper
 
@@ -140,7 +167,6 @@ def get_adjusted_date():
 def calculate_difference(data: List[str]) -> Tuple[int, int, Optional[datetime]]:
     # 获取今天的日期
     today = get_adjusted_date()
-    real_today = today.replace(hour=0, minute=0, second=0, microsecond=0)
 
     date_dict = {}
     for item in data:

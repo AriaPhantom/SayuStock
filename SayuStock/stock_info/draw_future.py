@@ -1,22 +1,26 @@
 import random
 import asyncio
-from datetime import datetime
-from typing import Any, Dict, List, Union, Callable, Optional
+from typing import Any, Dict, List, Tuple, Union, Callable, Optional
 from pathlib import Path
+from datetime import datetime
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+
 from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
 
 from .draw_info import draw_block
 from .get_jp_data import get_jpy
-from ..utils.image import get_footer, draw_glass_card
+from ..utils.image import get_footer
 from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
 from ..utils.constant import bond, whsc, i_code, commodity
 from ..utils.stock.request import get_gg, get_mtdata
 
 TEXT_PATH = Path(__file__).parent / "texture2d"
 DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
+FUTURE_IMG_CACHE_SECONDS = 20
+FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
+FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
 
 
 async def __get_data(result: Dict, stock: str):
@@ -53,6 +57,31 @@ async def append_jpy(result: Dict):
 
 
 async def draw_future_img():
+    global FUTURE_IMG_CACHE, FUTURE_IMG_LOCK
+
+    now = datetime.now()
+    if FUTURE_IMG_CACHE:
+        cache_time, cache_result = FUTURE_IMG_CACHE
+        if (now - cache_time).total_seconds() < FUTURE_IMG_CACHE_SECONDS:
+            return cache_result
+
+    if FUTURE_IMG_LOCK is None:
+        FUTURE_IMG_LOCK = asyncio.Lock()
+
+    async with FUTURE_IMG_LOCK:
+        now = datetime.now()
+        if FUTURE_IMG_CACHE:
+            cache_time, cache_result = FUTURE_IMG_CACHE
+            if (now - cache_time).total_seconds() < FUTURE_IMG_CACHE_SECONDS:
+                return cache_result
+
+        result = await _draw_future_img_uncached()
+        if not isinstance(result, str):
+            FUTURE_IMG_CACHE = (datetime.now(), result)
+        return result
+
+
+async def _draw_future_img_uncached():
     data1 = await get_mtdata("国际市场")
     if not isinstance(data1, dict):
         return str(data1)
@@ -77,15 +106,21 @@ async def draw_future_img():
     data5: DataLike = safe_data(results[3])
 
     # --- V3 Data-First Background ---
-    w, h = 900, 2800 
-    img = Image.new("RGBA", (w, h), (7, 8, 12, 255)) 
+    w, h = 900, 2800
+    img = Image.new("RGBA", (w, h), (7, 8, 12, 255))
     draw = ImageDraw.Draw(img)
 
     # 1. 紧凑型顶部状态 (移除时间线)
     draw.rectangle([0, 0, w, 80], fill=(20, 21, 26, 255))
     draw.text((40, 40), "// GLOBAL MARKET REAL-TIME MONITOR", (0, 255, 255, 200), font=ss_font(28), anchor="lm")
-    draw.text((w-40, 40), f"STATUS: ACTIVE | {datetime.now().strftime('%H:%M:%S')}", (100, 100, 120), font=ss_font(18), anchor="rm")
-    
+    draw.text(
+        (w - 40, 40),
+        f"STATUS: ACTIVE | {datetime.now().strftime('%H:%M:%S')}",
+        (100, 100, 120),
+        font=ss_font(18),
+        anchor="rm",
+    )
+
     ox = 210
     oy = 125
     data_gz: List[Dict] = data1["data"]["diff"]
@@ -104,7 +139,7 @@ async def draw_future_img():
     async def paste_blocks_dynamic(data_list: DataLike, keys, y_start, title, accent_color, block_type=None):
         if not data_list:
             return 0
-        
+
         # 预检查是否有实际内容
         items = data_list.values() if isinstance(data_list, dict) else data_list
         valid_items = []
@@ -115,7 +150,7 @@ async def draw_future_img():
                 if pure_name == d:
                     valid_items.append(item)
                     break
-        
+
         if not valid_items:
             return 0
 
@@ -132,7 +167,7 @@ async def draw_future_img():
                 block,
             )
             index += 1
-        
+
         # 返回占用的高度
         rows = (index + 3) // 4
         return rows * oy + 60
