@@ -676,6 +676,7 @@ async def get_price_and_change_simple(
     通过单次异步请求OKX指数API，高效获取BTC的最新价格、
     滚动24小时涨跌幅和UTC+8当天涨跌幅。
     """
+    global LAST_OKX_ERROR_TIME
     try:
         if client is not None:
             return await _get_price_and_change_simple_once(crypto, client)
@@ -690,7 +691,6 @@ async def get_price_and_change_simple(
                     last_error = e
                 
                 now = datetime.datetime.now()
-                global LAST_OKX_ERROR_TIME
                 if (now - LAST_OKX_ERROR_TIME).total_seconds() > 300:
                     logger.warning(f"OKX request via {proxy or 'direct'} failed (cooldown): {e}")
                     LAST_OKX_ERROR_TIME = now
@@ -703,7 +703,6 @@ async def get_price_and_change_simple(
         return None
     except (KeyError, IndexError, ValueError) as e:
         now = datetime.datetime.now()
-        global LAST_OKX_ERROR_TIME
         if (now - LAST_OKX_ERROR_TIME).total_seconds() > 300:
             logger.error(f"解析或计算数据时出错 (冷却中): {e}")
             LAST_OKX_ERROR_TIME = now
