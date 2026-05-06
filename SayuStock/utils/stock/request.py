@@ -577,7 +577,7 @@ async def stock_request(
 
 
 async def get_dc_token(force_refresh: bool = False):
-    global DC_TOKEN, DC_TOKEN_LOCK
+    global DC_TOKEN, DC_TOKEN_LOCK, LAST_DC_REFRESH, LAST_DC_FAILURE
 
     if DC_TOKEN and not force_refresh:
         return DC_TOKEN
@@ -601,7 +601,6 @@ async def get_dc_token(force_refresh: bool = False):
             return DC_TOKEN
 
         # 失败熔断：如果最近一次失败在 2 分钟内，不再尝试，避免阻塞
-        global LAST_DC_FAILURE
         if (now - LAST_DC_FAILURE).total_seconds() < 120:
             logger.warning("[SayuStock] DC-Token 最近刷新失败，熔断中，跳过浏览器启动。")
             return DC_TOKEN
@@ -609,7 +608,6 @@ async def get_dc_token(force_refresh: bool = False):
         token = await _fetch_dc_token()
         if token:
             DC_TOKEN = token
-            global LAST_DC_REFRESH
             LAST_DC_REFRESH = now
         else:
             LAST_DC_FAILURE = now

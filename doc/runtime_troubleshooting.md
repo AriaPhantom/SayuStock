@@ -183,3 +183,24 @@ Expected effect:
 - 	rends2/get should stop doing a guaranteed fail-first cycle
 - all-weather commodity / bond / FX sections should speed up materially
 - warning volume in GSUID logs should drop again because cached DC cookies are now reused for both live and historical Eastmoney stock APIs
+
+## 2026-05-06 DC-token global declaration compile guard
+
+Symptom:
+
+- `python -m py_compile SayuStock/utils/stock/request.py` failed with:
+  - `SyntaxError: name 'LAST_DC_REFRESH' is used prior to global declaration`
+
+Root cause:
+
+1. `get_dc_token()` read `LAST_DC_REFRESH` before its inner `global LAST_DC_REFRESH` declaration.
+2. Python applies `global` to the whole function body, so late declarations after a prior textual use are invalid.
+
+Fix in this patch:
+
+- move `LAST_DC_REFRESH` and `LAST_DC_FAILURE` into the top-level `global` declaration at the start of `get_dc_token()`
+- remove the inner `global` statements
+
+Verification:
+
+- `python -m py_compile SayuStock/utils/stock/request.py`
