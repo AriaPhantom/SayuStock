@@ -289,3 +289,24 @@ Validation:
 - local `draw_future_img()` enriched simulation rendered London gold/silver/copper, WTI, Brent, and Japan 30Y/10Y/2Y; image size `900x1295`, elapsed `0.0077s`
 - VPS validation after deploy returned commodity count `13` including London gold/silver/copper, WTI, and Brent
 - VPS validation returned bond count `9` including Japan 30Y/10Y/2Y; generated image bytes length `294922`; total validation time `1.867s`, draw phase `1.348s`
+
+## 2026-05-07 China market color convention and all-weather layout pass
+
+User feedback:
+
+- `全天候` and `大盘概览` must follow China market colors: red means up, green means down
+- the enlarged all-weather asset universe needed a tighter layout
+
+Fix in this patch:
+
+- flip the shared compact `draw_block()` card colors so positive changes render red and negative changes render green
+- render flat/zero changes in a neutral gray instead of incorrectly treating them as an up move
+- fix the `calculate_alpha()` negative threshold guard so near-zero changes remain neutral
+- tighten the all-weather header, avoid title/status overlap, and place the enlarged asset universe in rounded section panels with asset counts
+- keep the existing streaming `curr_y` layout and dynamic crop so expanded commodities, bonds, FX, and crypto remain fully visible without a bottom black tail
+
+Validation:
+
+- `python -m py_compile SayuStock/stock_info/draw_info.py SayuStock/stock_info/draw_future.py`
+- local isolated `draw_block()` pixel probe returned up `(239, 68, 68)`, down `(34, 197, 94)`, flat `(96, 100, 118)`
+- local all-weather stub render covered 16 global indices, 14 commodities, 11 bonds/yields, 8 FX pairs, and 4 crypto cards; generated image size `900x2235`, elapsed `0.086s`

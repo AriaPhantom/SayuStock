@@ -78,7 +78,7 @@ def calculate_alpha(diff: float) -> Tuple[int, int, int, int]:
 
     if diff >= 0.1:
         return (185, 0, 6, alpha)
-    elif diff <= 0.1:
+    elif diff <= -0.1:
         return (59, 140, 18, alpha)
 
     return (41, 41, 41, 200)
@@ -123,14 +123,18 @@ async def draw_block(zs_diff: Dict, _type: str = "diff"):
     zs_draw = ImageDraw.Draw(zs_img)
 
     # 颜色与强度计算
-    is_up = diff >= 0
+    is_up = diff > 0
+    is_down = diff < 0
     intensity = min(abs(diff) / 5.0, 1.0) # 5% 涨跌即满强度
     if is_up:
+        base_color = (239, 68, 68)
+        glow_color = (239, 68, 68, int(40 * intensity))
+    elif is_down:
         base_color = (34, 197, 94)
         glow_color = (34, 197, 94, int(40 * intensity))
     else:
-        base_color = (239, 68, 68)
-        glow_color = (239, 68, 68, int(40 * intensity))
+        base_color = (96, 100, 118)
+        glow_color = (96, 100, 118, 0)
         
     accent_color = (*base_color, 255)
     glass_bg = (15, 16, 22, 240) 

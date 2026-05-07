@@ -161,23 +161,26 @@ async def _draw_future_img_uncached():
     draw = ImageDraw.Draw(img)
 
     # 1. 紧凑型顶部状态 (移除时间线)
-    draw.rectangle([0, 0, w, 80], fill=(20, 21, 26, 255))
-    draw.text((40, 40), "// GLOBAL MARKET REAL-TIME MONITOR", (0, 255, 255, 200), font=ss_font(28), anchor="lm")
+    draw.rectangle([0, 0, w, 78], fill=(20, 21, 26, 255))
+    draw.text((36, 28), "// GLOBAL MARKET REAL-TIME", (0, 255, 255, 200), font=ss_font(26), anchor="lm")
+    draw.text((38, 56), "ALL WEATHER ASSET DASHBOARD", (96, 100, 118), font=ss_font(14), anchor="lm")
     draw.text(
-        (w - 40, 40),
+        (w - 36, 40),
         f"STATUS: ACTIVE | {datetime.now().strftime('%H:%M:%S')}",
         (100, 100, 120),
         font=ss_font(18),
         anchor="rm",
     )
 
+    columns = 4
+    block_start_x = 30
     ox = 210
-    oy = 125
+    oy = 118
     data_gz: List[Dict] = data1["data"]["diff"]
 
 
     # 绘制各板块 (流式布局，避免空白)
-    curr_y = 150
+    curr_y = 134
     sections = [
         (data_gz, i_code, "GLOBAL INDICES", (239, 68, 68), None),
         (data2, commodity, "COMMODITIES", (168, 85, 247), "single"),
@@ -207,35 +210,52 @@ async def _draw_future_img_uncached():
         if not valid_items:
             return 0
 
-        # 绘制标题
-        draw.rectangle([40, y_start - 30, 45, y_start - 10], fill=accent_color)
-        draw.text((60, y_start - 20), f"{title}", (180, 180, 190), font=ss_font(22), anchor="lm")
+        rows = (len(valid_items) + columns - 1) // columns
+        grid_top = y_start + 8
+        section_bottom = grid_top + 115 + (rows - 1) * oy + 18
+
+        # 绘制分区底板与标题
+        draw.rounded_rectangle(
+            [30, y_start - 42, w - 30, section_bottom],
+            radius=10,
+            fill=(11, 13, 18, 225),
+            outline=(255, 255, 255, 16),
+            width=1,
+        )
+        draw.rectangle([40, y_start - 28, 46, y_start - 6], fill=accent_color)
+        draw.text((60, y_start - 17), f"{title}", (190, 190, 200), font=ss_font(22), anchor="lm")
+        draw.text(
+            (w - 46, y_start - 17),
+            f"{len(valid_items)} ASSETS",
+            (96, 100, 118),
+            font=ss_font(14),
+            anchor="rm",
+        )
 
         index = 0
         for item in valid_items:
             block = await draw_block(item, block_type) if block_type else await draw_block(item)
             img.paste(
                 block,
-                (40 + ox * (index % 4), y_start + 10 + oy * (index // 4)),
+                (block_start_x + ox * (index % columns), grid_top + oy * (index // columns)),
                 block,
             )
             index += 1
 
         # 返回占用的高度
-        rows = (index + 3) // 4
-        return rows * oy + 60
+        return section_bottom - y_start
 
     for d_list, keys, title, color, b_type in sections:
         height_used = await paste_blocks_dynamic(d_list, keys, curr_y, title, color, b_type)
         if height_used > 0:
-            curr_y += height_used + 40 # 加上间距
+            curr_y += height_used + 46 # 加上间距
 
     # 页脚 (动态位置)
     footer = get_footer()
-    img.paste(footer, (w//2 - footer.width//2, curr_y + 20), footer)
+    img.paste(footer, (w//2 - footer.width//2, curr_y + 14), footer)
 
     # 裁剪图片，去除底部多余空白
-    final_h = min(curr_y + 120, h)
+    final_h = min(curr_y + 104, h)
     img = img.crop((0, 0, w, final_h))
 
     res = await convert_img(img)
