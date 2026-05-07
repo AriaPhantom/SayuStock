@@ -50,6 +50,47 @@ async def _get_data(_d: Dict, other_call: Optional[Callable] = None):
     return result
 
 
+async def _get_list_data(_d: Dict):
+    fs = ",".join(f"i:{code}" for code in _d.values() if code)
+    if not fs:
+        return {}
+
+    resp = await get_mtdata(fs, pz=max(len(_d), 20))
+    if not isinstance(resp, dict):
+        return await _get_data(_d)
+
+    data = resp.get("data")
+    if not isinstance(data, dict):
+        return await _get_data(_d)
+
+    diff = data.get("diff")
+    if not isinstance(diff, list):
+        return await _get_data(_d)
+
+    code_to_name = {
+        str(code).split(".")[-1].upper(): name
+        for name, code in _d.items()
+    }
+    result = {}
+    for item in diff:
+        if not isinstance(item, dict):
+            continue
+
+        display_name = code_to_name.get(str(item.get("f12", "")).upper())
+        if display_name is None:
+            display_name = item.get("f14")
+        if display_name not in _d:
+            continue
+
+        item["f58"] = display_name
+        item["f43"] = item.get("f2")
+        item["f170"] = item.get("f3")
+        item["f48"] = item.get("f6", "")
+        result[display_name] = item
+
+    return result or await _get_data(_d)
+
+
 async def append_jpy(result: Dict):
     data = await get_jpy()
     if data is None:
@@ -90,9 +131,9 @@ async def _draw_future_img_uncached():
 
     # 并发获取数据
     results = await asyncio.gather(
-        _get_data(commodity),
-        _get_data(bond, append_jpy),
-        _get_data(whsc),
+        _get_list_data(commodity),
+        _get_list_data(bond),
+        _get_list_data(whsc),
         get_all_crypto_price(),
         return_exceptions=True,
     )
