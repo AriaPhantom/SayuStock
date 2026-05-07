@@ -23,14 +23,16 @@ FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
 FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
 
 
-async def __get_data(result: Dict, stock: str):
+async def __get_data(result: Dict, display_name: str, stock: str):
     await asyncio.sleep(random.uniform(0.2, 1))
     data = await get_gg(stock, "single-stock")
-    if isinstance(data, str):
+    if isinstance(data, str) or not isinstance(data, dict):
         return data
-    pure_name = data["data"]["f58"].split(" (")[0]
-    data["data"]["f58"] = pure_name
-    result[pure_name] = data["data"]
+    stock_data = data.get("data")
+    if not isinstance(stock_data, dict):
+        return data
+    stock_data["f58"] = display_name
+    result[display_name] = stock_data
     return result
 
 
@@ -42,9 +44,9 @@ async def _get_data(_d: Dict, other_call: Optional[Callable] = None):
 
     for i in _d:
         if _d[i]:
-            TASK.append(__get_data(result, _d[i]))
+            TASK.append(__get_data(result, i, _d[i]))
 
-    await asyncio.gather(*TASK)
+    await asyncio.gather(*TASK, return_exceptions=True)
     return result
 
 
@@ -144,9 +146,12 @@ async def _draw_future_img_uncached():
         items = data_list.values() if isinstance(data_list, dict) else data_list
         valid_items = []
         for d in keys:
+            if isinstance(data_list, dict) and d in data_list:
+                valid_items.append(data_list[d])
+                continue
             for item in items:
-                name = item.get("f58", item.get("f14"))
-                pure_name = name.split(" (")[0]
+                name = item.get("f58") or item.get("f14") or ""
+                pure_name = str(name).split(" (")[0]
                 if pure_name == d:
                     valid_items.append(item)
                     break

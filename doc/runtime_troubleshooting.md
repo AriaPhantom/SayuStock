@@ -237,3 +237,26 @@ Follow-up from VPS validation:
 Operational note:
 
 - normal VPS `git fetch` from GitHub timed out from the server network; production was hot-deployed by SFTP after local commit/push, then `systemctl restart gsuid` and journal checks were run
+
+## 2026-05-06 all-weather commodity/bond/FX sections hidden
+
+Symptom:
+
+- the `all-weather` image rendered `GLOBAL INDICES` and `CRYPTO`, but skipped `COMMODITIES`, `BONDS & YIELDS`, and `FOREX`
+
+Root cause:
+
+1. the dynamic all-weather renderer only draws a section when fetched item names exactly match the configured section labels
+2. Eastmoney single-symbol responses can return display names that differ from the local labels used in `commodity`, `bond`, and `whsc`
+3. one failing sub-request could also raise through `asyncio.gather()` and collapse the whole section to `None`
+
+Fix in this patch:
+
+- normalize all-weather single-symbol items to the configured display label before rendering
+- let the renderer prefer dictionary-key matches for section data
+- gather per-symbol sub-requests with `return_exceptions=True` so one bad symbol does not hide the whole section
+
+Validation:
+
+- `python -m py_compile SayuStock/stock_info/draw_future.py`
+- local `draw_future_img()` simulation with mismatched API display names rendered commodity, bond, FX, and crypto blocks; image size `900x1395`, elapsed `0.9913s`
