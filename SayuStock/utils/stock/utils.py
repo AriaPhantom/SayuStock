@@ -164,33 +164,44 @@ def get_adjusted_date():
     return adjusted_date
 
 
-def calculate_difference(data: List[str]) -> Tuple[int, int, Optional[datetime]]:
-    # 获取今天的日期
-    today = get_adjusted_date()
+def calculate_difference(data: List[str]) -> Tuple[float, float, Optional[datetime]]:
+    # trends2 的 f57 是每分钟成交额；按完整交易日聚合，并用上一交易日同一时刻作放/缩量对比。
+    target_day = get_adjusted_date().replace(hour=0, minute=0, second=0, microsecond=0)
 
-    date_dict = {}
+    date_dict: Dict[datetime, List[Tuple[datetime, float]]] = {}
     for item in data:
         item_part = item.split(",")
-        date_day = datetime.strptime(item_part[0], "%Y-%m-%d %H:%M")
-        if date_day.day not in date_dict:
-            date_dict[date_day.day] = []
-        date_dict[date_day.day].append(float(item_part[6]))
+        if len(item_part) <= 6:
+            continue
 
-    is_trading_day = today.day in date_dict
-    for _ in range(4):
-        if today.day not in date_dict:
-            today = today - timedelta(days=1)
-        else:
-            break
-    else:
+        date_time = datetime.strptime(item_part[0], "%Y-%m-%d %H:%M")
+        date_day = date_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_dict.setdefault(date_day, []).append((date_time, float(item_part[6])))
+
+    available_days = sorted(date_dict)
+    if not available_days:
+        return 0, 0, None
+
+    today_candidates = [day for day in available_days if day <= target_day]
+    today = today_candidates[-1] if today_candidates else available_days[-1]
+    today_data = sorted(date_dict[today], key=lambda item: item[0])
+    if not today_data:
         return 0, 0, None
 
     logger.info(f"[SayuStock]今天交易日: {today}")
-    all_today_data = sum(date_dict[today.day])
-    all_today_len = len(date_dict[today.day])
-    del date_dict[today.day]
+    all_today_data = sum(amount for _, amount in today_data)
+    current_time = today_data[-1][0].time()
 
-    all_yestoday_data = sum(list(date_dict.values())[0][:all_today_len])
+    all_yestoday_data = 0.0
+    previous_days = [day for day in available_days if day < today]
+    if previous_days:
+        previous_data = sorted(date_dict[previous_days[-1]], key=lambda item: item[0])
+        comparable_data = [amount for date_time, amount in previous_data if date_time.time() <= current_time]
+        if comparable_data:
+            all_yestoday_data = sum(comparable_data)
+        elif previous_data:
+            all_yestoday_data = previous_data[0][1]
+
     # 返回实际交易日期，若是今天则返回None表示正常交易日
-    actual_date = None if is_trading_day else today.replace(hour=0, minute=0, second=0, microsecond=0)
+    actual_date = None if today == target_day else today
     return all_today_data, all_today_data - all_yestoday_data, actual_date

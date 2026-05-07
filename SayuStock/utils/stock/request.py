@@ -149,10 +149,23 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
         if isinstance(data, int):
             logger.warning(f"[SayuStock] 获取{mk}数据失败, 错误码: {data}")
             continue
-        ya0, y0, ltd = calculate_difference(data["data"]["trends"])
+
+        data_payload = data.get("data") if isinstance(data, dict) else None
+        trends = data_payload.get("trends") if isinstance(data_payload, dict) else None
+        if not isinstance(trends, list) or not trends:
+            logger.warning(f"[SayuStock] 获取{mk}分时成交额失败，返回数据为空")
+            continue
+
+        try:
+            ya0, y0, ltd = calculate_difference(trends)
+        except (IndexError, KeyError, TypeError, ValueError) as e:
+            logger.warning(f"[SayuStock] 解析{mk}分时成交额失败: {e}")
+            continue
+
         y += y0
         ya += ya0
-        last_trade_date = ltd
+        if ltd is not None:
+            last_trade_date = ltd
     return ya, y, last_trade_date
 
 

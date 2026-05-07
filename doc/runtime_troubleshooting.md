@@ -310,3 +310,29 @@ Validation:
 - `python -m py_compile SayuStock/stock_info/draw_info.py SayuStock/stock_info/draw_future.py`
 - local isolated `draw_block()` pixel probe returned up `(239, 68, 68)`, down `(34, 197, 94)`, flat `(96, 100, 118)`
 - local all-weather stub render covered 16 global indices, 14 commodities, 11 bonds/yields, 8 FX pairs, and 4 crypto cards; generated image size `900x2235`, elapsed `0.086s`
+
+## 2026-05-07 market overview turnover robustness
+
+User feedback:
+
+- `大盘概览` turnover / volume display should be repaired as much as possible
+
+Root cause:
+
+- the existing `calculate_difference()` grouped intraday trend rows by day-of-month only, which is fragile around month boundaries
+- it only searched back four calendar days, so long holidays could make the market overview show zero or stale turnover
+- `get_hours_from_em()` assumed Eastmoney always returned a non-empty `data.trends` list, so malformed responses could break the volume panel
+
+Fix in this patch:
+
+- group trend rows by full trading date instead of just day number
+- select the latest available trading day not later than the adjusted target day, which handles weekends and longer holidays better
+- keep the correct `trends2` semantics: `f57` is per-minute turnover, so daily/current turnover is still the sum of all rows for that trading day
+- compare against the previous trading day up to the same latest intraday timestamp for a better `放量` / `缩量` value
+- add defensive validation around empty or malformed `data.trends`
+
+Validation:
+
+- `python -m py_compile SayuStock/utils/stock/utils.py SayuStock/utils/stock/request.py SayuStock/stock_info/draw_info.py`
+- isolated live Eastmoney trends probe for China midday `2026-05-07` returned Shanghai current turnover `864218308640.0`, same-time diff `-77502786416.0`; Shenzhen current turnover `1118236505408.0`, same-time diff `-20099117344.0`
+- local `draw_info_img()` stub render completed with image size `1700x2860`, elapsed `0.2011s`
