@@ -48,8 +48,11 @@ def calculate_change_rate(a: float, b: float):
 
 async def get_jpy():
     url = "https://zh.tradingeconomics.com/japan/government-bond-yield"
-    symbol_to_find1 = "GJGB30Y:IND"
-    symbol_to_find2 = "GJGB10:IND"
+    symbols = {
+        "日本30年期国债收益率": "GJGB30Y:IND",
+        "日本10年期国债收益率": "GJGB10:IND",
+        "日本2年期国债收益率": "GJGB2Y:IND",
+    }
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit"
@@ -63,34 +66,26 @@ async def get_jpy():
 
     soup = BeautifulSoup(html_content, "html.parser")
 
-    y30 = await get_live_pch_by_symbol(soup, symbol_to_find1)
-    y10 = await get_live_pch_by_symbol(soup, symbol_to_find2)
+    result = {}
+    for name, symbol in symbols.items():
+        data = await get_live_pch_by_symbol(soup, symbol)
+        if data is None:
+            continue
 
-    if y30 is None or y10 is None:
+        diff = calculate_change_rate(data[0], data[1])
+        logger.debug(f"{symbol}: {data[0]} ({diff:.2%})")
+        result[name] = {
+            "f58": name,
+            "f14": name,
+            "f43": data[1],
+            "f170": diff,
+            "f48": "",
+        }
+
+    if not result:
         return None
 
-    diff30 = calculate_change_rate(y30[0], y30[1])
-    diff10 = calculate_change_rate(y10[0], y10[1])
-
-    logger.debug(f"y30: {y30[0]} ({diff30:.2%})")
-    logger.debug(f"y10: {y10[0]} ({diff10:.2%})")
-
-    return {
-        "JP 30Y": {
-            "f58": "JP 30Y",
-            "f14": "JP 30Y",
-            "f43": y30[1],
-            "f170": diff30,
-            "f48": "",
-        },
-        "JP 10Y": {
-            "f58": "JP 10Y",
-            "f14": "JP 10Y",
-            "f43": y10[1],
-            "f170": diff10,
-            "f48": "",
-        },
-    }
+    return result
 
 
 if __name__ == "__main__":

@@ -265,3 +265,25 @@ Validation:
 - VPS probe confirmed `clist/get` returns commodity, bond, and FX data for explicit `i:<secid>` lists while the single-symbol stock path can disconnect
 - VPS `draw_future_img()` validation after deploy returned non-empty sections: commodity `9`, bond `6`, FX `8`; generated `bytes` result length `258789`; total validation time `1.761s`, draw phase `1.529s`
 - `systemctl restart gsuid`, `systemctl is-active gsuid`, and `journalctl -u gsuid -n 80` confirmed the service is active and loaded without SayuStock syntax/runtime startup errors
+
+## 2026-05-07 all-weather commodity and Japan bond coverage
+
+User feedback:
+
+- the commodity panel should include London gold/silver/copper and WTI explicitly
+- the bond panel should include Japan yields, not only China and US yields
+
+Fix in this patch:
+
+- add London gold `122.XAU`, London silver `122.XAG`, and London copper `109.LCPT` to the all-weather commodity universe
+- relabel `102.CL00Y` from generic `NYMEX原油` to explicit `WTI原油`
+- switch Brent to Eastmoney's current continuous futures code `112.B00Y`
+- keep COMEX gold/silver/copper, natural gas, platinum, and selected domestic commodity futures
+- add Japan 30Y/10Y/2Y display slots in the bond universe
+- update TradingEconomics Japan-yield scraping to return Chinese display names for Japan 30Y/10Y/2Y
+- merge Japan yield data back into the all-weather bond section before rendering
+
+Validation:
+
+- `python -m py_compile SayuStock/utils/constant.py SayuStock/stock_info/get_jp_data.py SayuStock/stock_info/draw_future.py`
+- local `draw_future_img()` enriched simulation rendered London gold/silver/copper, WTI, Brent, and Japan 30Y/10Y/2Y; image size `900x1295`, elapsed `0.0077s`

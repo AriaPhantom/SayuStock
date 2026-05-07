@@ -70,6 +70,7 @@ async def _get_list_data(_d: Dict):
     code_to_name = {
         str(code).split(".")[-1].upper(): name
         for name, code in _d.items()
+        if code
     }
     result = {}
     for item in diff:
@@ -89,6 +90,12 @@ async def _get_list_data(_d: Dict):
         result[display_name] = item
 
     return result or await _get_data(_d)
+
+
+async def _get_bond_data():
+    result = await _get_list_data(bond)
+    await append_jpy(result)
+    return result
 
 
 async def append_jpy(result: Dict):
@@ -132,7 +139,7 @@ async def _draw_future_img_uncached():
     # 并发获取数据
     results = await asyncio.gather(
         _get_list_data(commodity),
-        _get_list_data(bond),
+        _get_bond_data(),
         _get_list_data(whsc),
         get_all_crypto_price(),
         return_exceptions=True,
