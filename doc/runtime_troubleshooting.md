@@ -263,3 +263,5 @@ Validation:
 - `python -m py_compile SayuStock/stock_info/draw_future.py SayuStock/utils/stock/request.py SayuStock/utils/stock/utils.py`
 - local `draw_future_img()` list-endpoint simulation rendered commodity, bond, FX, and crypto blocks; image size `900x1170`, elapsed `0.0099s`
 - VPS probe confirmed `clist/get` returns commodity, bond, and FX data for explicit `i:<secid>` lists while the single-symbol stock path can disconnect
+- VPS `draw_future_img()` validation after deploy returned non-empty sections: commodity `9`, bond `6`, FX `8`; generated `bytes` result length `258789`; total validation time `1.761s`, draw phase `1.529s`
+- `systemctl restart gsuid`, `systemctl is-active gsuid`, and `journalctl -u gsuid -n 80` confirmed the service is active and loaded without SayuStock syntax/runtime startup errors
