@@ -287,3 +287,5 @@ Validation:
 
 - `python -m py_compile SayuStock/utils/constant.py SayuStock/stock_info/get_jp_data.py SayuStock/stock_info/draw_future.py`
 - local `draw_future_img()` enriched simulation rendered London gold/silver/copper, WTI, Brent, and Japan 30Y/10Y/2Y; image size `900x1295`, elapsed `0.0077s`
+- VPS validation after deploy returned commodity count `13` including London gold/silver/copper, WTI, and Brent
+- VPS validation returned bond count `9` including Japan 30Y/10Y/2Y; generated image bytes length `294922`; total validation time `1.867s`, draw phase `1.348s`
