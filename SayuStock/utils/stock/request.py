@@ -47,6 +47,8 @@ DC_TOKEN_FILE = MAIN_PATH / "dc_token.json"
 DC_TOKEN_EXPIRE_FALLBACK = timedelta(days=7)
 DC_TOKEN_EXPIRE_SAFETY = timedelta(minutes=5)
 DC_FORCE_REFRESH_COOLDOWN = timedelta(seconds=60)
+LAST_TURNOVER_TRENDS_FAILURE = datetime.min
+TURNOVER_TRENDS_FAILURE_COOLDOWN = timedelta(minutes=2)
 
 
 def _need_dc_token(url: str) -> bool:
@@ -130,6 +132,14 @@ async def _save_persisted_dc_token(token: str, expire_at: datetime) -> None:
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
+    global LAST_TURNOVER_TRENDS_FAILURE
+
+    if datetime.now() - LAST_TURNOVER_TRENDS_FAILURE < TURNOVER_TRENDS_FAILURE_COOLDOWN:
+        snapshot_amount = await _get_market_turnover_snapshot()
+        if snapshot_amount > 0:
+            logger.info("[SayuStock] 分时成交额端点冷却中，直接使用 clist 快照。")
+            return snapshot_amount, 0, None
+
     URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
     y = 0
     ya = 0
@@ -170,6 +180,7 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
             last_trade_date = ltd
 
     if success_count < 2:
+        LAST_TURNOVER_TRENDS_FAILURE = datetime.now()
         snapshot_amount = await _get_market_turnover_snapshot()
         if snapshot_amount > 0:
             logger.info("[SayuStock] 使用 clist 快照修正大盘概览成交额。")

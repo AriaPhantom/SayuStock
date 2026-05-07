@@ -332,6 +332,7 @@ Fix in this patch:
 - add defensive validation around empty or malformed `data.trends`
 - when the VPS cannot reach both `trends2` index endpoints, fall back to the more stable `clist/get` snapshot for current Shanghai + Shenzhen turnover
 - when only the snapshot fallback is available, render the volume delta as `量差: 暂缺` instead of a misleading zero shrinkage value
+- add a short in-process cooldown after `trends2` turnover failures so repeated market-overview commands use the snapshot immediately instead of repeatedly paying the slow failing path
 
 Validation:
 
