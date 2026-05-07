@@ -398,9 +398,12 @@ async def draw_info_img(is_save: bool = False):
     if f6diff > 0:
         f6diff_str = f"放量: {number_to_chinese(abs(f6diff))}"
         fcolor = (186, 26, 27, 100)
-    else:
+    elif f6diff < 0:
         f6diff_str = f"缩量: {number_to_chinese(abs(f6diff))}"
         fcolor = (18, 199, 30, 100)
+    else:
+        f6diff_str = "量差: 暂缺"
+        fcolor = (160, 160, 160, 100)
 
     time_color = (186, 26, 27, 100) if sz_diff >= 0 else (18, 199, 30, 100)
 

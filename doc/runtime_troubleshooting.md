@@ -330,6 +330,8 @@ Fix in this patch:
 - keep the correct `trends2` semantics: `f57` is per-minute turnover, so daily/current turnover is still the sum of all rows for that trading day
 - compare against the previous trading day up to the same latest intraday timestamp for a better `放量` / `缩量` value
 - add defensive validation around empty or malformed `data.trends`
+- when the VPS cannot reach both `trends2` index endpoints, fall back to the more stable `clist/get` snapshot for current Shanghai + Shenzhen turnover
+- when only the snapshot fallback is available, render the volume delta as `量差: 暂缺` instead of a misleading zero shrinkage value
 
 Validation:
 

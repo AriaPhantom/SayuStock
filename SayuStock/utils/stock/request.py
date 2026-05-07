@@ -133,6 +133,7 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
     URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
     y = 0
     ya = 0
+    success_count = 0
     last_trade_date: Optional[datetime] = None
     for mk in ["1.000001", "0.399001"]:
         params = {
@@ -164,9 +165,54 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
 
         y += y0
         ya += ya0
+        success_count += 1
         if ltd is not None:
             last_trade_date = ltd
+
+    if success_count < 2:
+        snapshot_amount = await _get_market_turnover_snapshot()
+        if snapshot_amount > 0:
+            logger.info("[SayuStock] 使用 clist 快照修正大盘概览成交额。")
+            return snapshot_amount, 0, last_trade_date
+
     return ya, y, last_trade_date
+
+
+async def _get_market_turnover_snapshot() -> float:
+    url = "http://push2.eastmoney.com/api/qt/clist/get"
+    params = [
+        ("pz", "2"),
+        ("po", "1"),
+        ("np", "1"),
+        ("fltt", "2"),
+        ("invt", "2"),
+        ("fid", "f3"),
+        ("pn", "1"),
+        ("fs", "i:1.000001,i:0.399001"),
+        ("fields", "f12,f14,f6"),
+    ]
+    resp = await stock_request(url, "GET", params=params)
+    if isinstance(resp, int):
+        logger.warning(f"[SayuStock] 获取大盘成交额快照失败, 错误码: {resp}")
+        return 0
+
+    data = resp.get("data") if isinstance(resp, dict) else None
+    diff = data.get("diff") if isinstance(data, dict) else None
+    if not isinstance(diff, list):
+        logger.warning("[SayuStock] 获取大盘成交额快照失败，返回数据为空")
+        return 0
+
+    total = 0.0
+    for item in diff:
+        if not isinstance(item, dict):
+            continue
+        amount = item.get("f6", 0)
+        try:
+            total += float(amount)
+        except (TypeError, ValueError):
+            continue
+
+    return total
 
 
 async def get_bar():
