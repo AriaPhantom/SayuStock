@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Tuple, Union, Optional
 from pathlib import Path
 from datetime import datetime
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageFilter
 
 from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
@@ -14,10 +14,6 @@ from ..utils.image import get_footer
 from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
 from ..utils.constant import bond, whsc, i_code, commodity
 from ..utils.stock.request import get_gg, get_mtdata
-
-# 字体辅助函数
-def ss_font(size):
-    return ImageFont.truetype(core_font, size)
 
 DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
 FUTURE_IMG_CACHE_SECONDS = 20
