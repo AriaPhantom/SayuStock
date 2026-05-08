@@ -17,7 +17,7 @@ from ..utils.stock.request import get_gg, get_mtdata
 
 TEXT_PATH = Path(__file__).parent / "texture2d"
 DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
-FUTURE_IMG_CACHE_SECONDS = 20
+FUTURE_IMG_CACHE_SECONDS = 0  # 禁用缓存，每次重新生成
 FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
 FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
 
