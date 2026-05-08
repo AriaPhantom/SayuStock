@@ -463,20 +463,29 @@ async def _draw_future_img_uncached():
         draw.text((w - 126, y_start + 32), f"{total_count} WATCHED", fill=(203, 213, 225), font=ss_font(13), anchor="mm")
         draw.rectangle([48, y_start + 58, w - 48, y_start + 59], fill=(255, 255, 255, 10))
 
-        # 分组绘制卡片
+        # 分组绘制卡片 (确保物理隔离，每组必起新行)
         current_row = 0
         for group in all_valid_groups:
+            # 绘制当前组的所有资产
             for idx, item in enumerate(group):
                 block = _draw_future_card(item, block_type)
-                local_row = idx // columns
-                local_col = idx % columns
+                # 这组内的行号（0, 1...）和列号（0, 1, 2, 3）
+                group_local_row = idx // columns
+                group_local_col = idx % columns
+                
+                # 绝对行号 = 之前已占用的总行数 + 组内偏移行号
+                absolute_row = current_row + group_local_row
+                
                 img.paste(
                     block,
-                    (CARD_START_X + ox * local_col, grid_top + oy * (current_row + local_row)),
+                    (CARD_START_X + ox * group_local_col, grid_top + oy * absolute_row),
                     block,
                 )
-            # 每组结束后，更新行偏移量
-            current_row += (len(group) + columns - 1) // columns
+            
+            # 重要：这组画完后，current_row 必须增加“这组占用的总行数”
+            # 哪怕这组只有 1 个资产，它也占了一整行
+            rows_taken_by_group = (len(group) + columns - 1) // columns
+            current_row += rows_taken_by_group
 
         return section_bottom - y_start
 
