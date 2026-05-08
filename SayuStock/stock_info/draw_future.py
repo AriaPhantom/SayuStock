@@ -427,25 +427,38 @@ async def _draw_future_img_uncached():
         oy = CARD_H + CARD_GAP_Y
         grid_top = y_start + 64
 
-        for group in all_valid_groups:
-            # 动态列数：如果这组只有 2 或 3 个，且没有下一行，则平铺
-            # 但为了整齐，我们固定用 4 列，但强制这组占满其所有行
-            cols_to_use = 4
-            group_ox = (SECTION_W - 32) // cols_to_use
-            
+        for group_idx, group in enumerate(all_valid_groups):
+            n = len(group)
+            # 自适应列数：≤4 个资产用 n 列均匀分布，>4 个用 4 列换行
+            if n <= 4:
+                cols = n
+                # 计算组内均匀分布：卡片在 SECTION_W 内居中
+                total_w = cols * CARD_W + (cols - 1) * CARD_GAP_X
+                margin = max(0, (SECTION_W - total_w)) // 2
+                start_x = CARD_START_X + margin
+                step_x = CARD_W + CARD_GAP_X
+                rows_used = 1
+            else:
+                cols = 4
+                start_x = CARD_START_X
+                step_x = CARD_W + CARD_GAP_X
+                rows_used = (n + cols - 1) // cols
+
             for idx, item in enumerate(group):
                 block = _draw_future_card(item, block_type)
-                local_row = idx // cols_to_use
-                local_col = idx % cols_to_use
+                if n <= 4:
+                    x = start_x + idx * step_x
+                    y = grid_top + oy * (current_row)
+                else:
+                    local_row = idx // cols
+                    local_col = idx % cols
+                    x = start_x + local_col * step_x
+                    y = grid_top + oy * (current_row + local_row)
                 
-                img.paste(
-                    block,
-                    (CARD_START_X + group_ox * local_col, grid_top + oy * (current_row + local_row)),
-                    block,
-                )
+                img.paste(block, (x, y), block)
             
-            # 这组结束，行号跳转到下一组
-            current_row += (len(group) + cols_to_use - 1) // cols_to_use
+            # 组间加 1 行空白实现物理隔离
+            current_row += rows_used + 1
 
         section_bottom = grid_top + current_row * oy + 10
         flat_count = total_count - up_count - down_count
