@@ -4,12 +4,11 @@ from typing import Any, Dict, List, Tuple, Union, Callable, Optional
 from pathlib import Path
 from datetime import datetime
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
 
-from .draw_info import draw_block
 from .get_jp_data import get_jpy
 from ..utils.image import get_footer
 from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
@@ -21,6 +20,197 @@ DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
 FUTURE_IMG_CACHE_SECONDS = 20
 FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
 FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
+
+CARD_W = 196
+CARD_H = 104
+CARD_GAP_X = 12
+CARD_GAP_Y = 12
+CARD_START_X = 40
+SECTION_X = 24
+SECTION_W = 852
+CHINA_UP_RED = (239, 68, 68)
+CHINA_DOWN_GREEN = (34, 197, 94)
+NEUTRAL_SLATE = (148, 163, 184)
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value in (None, "", "-", "--"):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fit_text(draw: ImageDraw.ImageDraw, text: Any, font, max_width: int) -> str:
+    text = str(text or "-")
+    if draw.textlength(text, font=font) <= max_width:
+        return text
+
+    ellipsis = "…"
+    for length in range(len(text) - 1, 0, -1):
+        candidate = f"{text[:length]}{ellipsis}"
+        if draw.textlength(candidate, font=font) <= max_width:
+            return candidate
+    return ellipsis
+
+
+def _format_price(value: Any) -> str:
+    if value in (None, "", "-", "--"):
+        return "-"
+    number = _safe_float(value)
+    if abs(number) >= 1000:
+        text = f"{number:.1f}"
+    elif abs(number) >= 100:
+        text = f"{number:.2f}"
+    elif abs(number) >= 10:
+        text = f"{number:.3f}"
+    else:
+        text = f"{number:.4f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _format_compact_number(value: Any) -> str:
+    number = _safe_float(value)
+    if number <= 0:
+        return "--"
+
+    units = [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ]
+    for base, suffix in units:
+        if number >= base:
+            return f"{number / base:.2f}{suffix}".rstrip("0").rstrip(".")
+    return f"{number:.0f}"
+
+
+def _get_future_card_fields(item: Dict[str, Any], block_type: Optional[str]):
+    if block_type == "single":
+        name = item.get("f58") or item.get("f14") or "-"
+        price = item.get("f43", item.get("f2", "-"))
+        diff = _safe_float(item.get("f170", item.get("f3", 0)))
+        amount = item.get("f48", item.get("f6", 0))
+    else:
+        name = item.get("f14") or item.get("f58") or "-"
+        price = item.get("f2", item.get("f43", "-"))
+        diff = _safe_float(item.get("f3", item.get("f170", 0)))
+        amount = item.get("f6", item.get("f48", 0))
+
+    return name, price, diff, amount, str(item.get("f12", "") or "")
+
+
+def _market_color(diff: float) -> Tuple[int, int, int]:
+    if diff > 0:
+        return CHINA_UP_RED
+    if diff < 0:
+        return CHINA_DOWN_GREEN
+    return NEUTRAL_SLATE
+
+
+def _draw_background(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
+    top = (2, 6, 23)
+    bottom = (3, 7, 18)
+    for y in range(h):
+        ratio = y / max(h - 1, 1)
+        color = tuple(int(top[i] * (1 - ratio) + bottom[i] * ratio) for i in range(3))
+        draw.line([(0, y), (w, y)], fill=(*color, 255))
+
+    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    glow_draw = ImageDraw.Draw(glow)
+    glow_draw.ellipse([-160, -120, 340, 250], fill=(14, 165, 233, 34))
+    glow_draw.ellipse([590, -180, 1080, 300], fill=(239, 68, 68, 24))
+    glow_draw.ellipse([230, 540, 760, 1180], fill=(34, 197, 94, 16))
+    glow = glow.filter(ImageFilter.GaussianBlur(58))
+    img.alpha_composite(glow)
+
+    for x in range(0, w, 60):
+        draw.line([(x, 0), (x, h)], fill=(255, 255, 255, 5), width=1)
+    for y in range(0, h, 60):
+        draw.line([(0, y), (w, y)], fill=(255, 255, 255, 4), width=1)
+
+
+def _draw_header(draw: ImageDraw.ImageDraw, w: int, now: datetime) -> None:
+    draw.rounded_rectangle(
+        [24, 22, w - 24, 120],
+        radius=22,
+        fill=(8, 13, 25, 238),
+        outline=(148, 163, 184, 34),
+        width=1,
+    )
+    draw.rectangle([24, 48, 28, 94], fill=(34, 211, 238, 220))
+    draw.text((44, 48), "SAYUSTOCK TERMINAL", fill=(125, 211, 252), font=ss_font(14), anchor="lm")
+    draw.text((44, 78), "All Weather Monitor", fill=(248, 250, 252), font=ss_font(34), anchor="lm")
+    draw.text(
+        (44, 105),
+        "GLOBAL INDICES · COMMODITIES · YIELDS · FX · CRYPTO",
+        fill=(100, 116, 139),
+        font=ss_font(13),
+        anchor="lm",
+    )
+
+    status_x = w - 44
+    draw.rounded_rectangle([status_x - 190, 38, status_x, 72], radius=17, fill=(15, 23, 42, 255), outline=(34, 211, 238, 72))
+    draw.ellipse([status_x - 178, 50, status_x - 168, 60], fill=(34, 197, 94))
+    draw.text((status_x - 154, 55), f"LIVE · {now.strftime('%H:%M:%S')}", fill=(226, 232, 240), font=ss_font(16), anchor="lm")
+
+    draw.rounded_rectangle([status_x - 236, 82, status_x, 108], radius=13, fill=(2, 6, 23, 210), outline=(148, 163, 184, 26))
+    draw.ellipse([status_x - 220, 91, status_x - 210, 101], fill=CHINA_UP_RED)
+    draw.text((status_x - 202, 96), "RED UP", fill=(203, 213, 225), font=ss_font(12), anchor="lm")
+    draw.ellipse([status_x - 132, 91, status_x - 122, 101], fill=CHINA_DOWN_GREEN)
+    draw.text((status_x - 114, 96), "GREEN DOWN", fill=(203, 213, 225), font=ss_font(12), anchor="lm")
+
+
+def _draw_future_card(item: Dict[str, Any], block_type: Optional[str] = None) -> Image.Image:
+    name, price, diff, amount, code = _get_future_card_fields(item, block_type)
+    accent = _market_color(diff)
+    is_up = diff > 0
+    is_down = diff < 0
+
+    card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(card)
+
+    intensity = min(abs(diff) / 5.0, 1.0)
+    glow = (*accent, int(28 + 42 * intensity)) if diff != 0 else (148, 163, 184, 28)
+    draw.rounded_rectangle([1, 1, CARD_W - 1, CARD_H - 1], radius=16, fill=glow)
+    draw.rounded_rectangle(
+        [3, 3, CARD_W - 3, CARD_H - 3],
+        radius=15,
+        fill=(9, 14, 25, 248),
+        outline=(*accent, 58 if diff != 0 else 34),
+        width=1,
+    )
+    draw.rounded_rectangle([12, 11, 48, 14], radius=2, fill=(*accent, 230))
+    draw.ellipse([CARD_W - 21, 13, CARD_W - 13, 21], fill=(*accent, 180))
+
+    f_price = ss_font(24)
+    f_diff = ss_font(16)
+    f_name = ss_font(18)
+    f_meta = ss_font(12)
+
+    price_text = _fit_text(draw, _format_price(price), f_price, 112)
+    diff_text = f"{'+' if is_up else ''}{round(diff, 2)}%"
+    if not is_up and not is_down:
+        diff_text = "0.0%"
+
+    draw.text((14, 34), price_text, fill=(*accent, 255), font=f_price, anchor="lm")
+    diff_w = int(draw.textlength(diff_text, font=f_diff))
+    pill_x0 = CARD_W - diff_w - 28
+    draw.rounded_rectangle([pill_x0, 22, CARD_W - 12, 48], radius=13, fill=(*accent, 26), outline=(*accent, 82))
+    draw.text((CARD_W - 20, 35), diff_text, fill=(*accent, 255), font=f_diff, anchor="rm")
+
+    name_text = _fit_text(draw, str(name).split(" (")[0], f_name, CARD_W - 24)
+    draw.text((14, 68), name_text, fill=(226, 232, 240), font=f_name, anchor="lm")
+
+    amount_text = _format_compact_number(amount)
+    meta_text = "LIVE" if amount_text == "--" else f"AMT {amount_text}"
+    draw.text((14, 91), meta_text, fill=(100, 116, 139), font=f_meta, anchor="lm")
+    if code and code != "None":
+        draw.text((CARD_W - 13, 91), _fit_text(draw, code, f_meta, 70), fill=(71, 85, 105), font=f_meta, anchor="rm")
+
+    return card
 
 
 async def __get_data(result: Dict, display_name: str, stock: str):
@@ -155,32 +345,23 @@ async def _draw_future_img_uncached():
     data4: DataLike = safe_data(results[2])
     data5: DataLike = safe_data(results[3])
 
-    # --- V3 Data-First Background ---
+    # --- V4 OLED Terminal Dashboard ---
     w, h = 900, 2800
-    img = Image.new("RGBA", (w, h), (7, 8, 12, 255))
+    img = Image.new("RGBA", (w, h), (2, 6, 23, 255))
     draw = ImageDraw.Draw(img)
 
-    # 1. 紧凑型顶部状态 (移除时间线)
-    draw.rectangle([0, 0, w, 78], fill=(20, 21, 26, 255))
-    draw.text((36, 28), "// GLOBAL MARKET REAL-TIME", (0, 255, 255, 200), font=ss_font(26), anchor="lm")
-    draw.text((38, 56), "ALL WEATHER ASSET DASHBOARD", (96, 100, 118), font=ss_font(14), anchor="lm")
-    draw.text(
-        (w - 36, 40),
-        f"STATUS: ACTIVE | {datetime.now().strftime('%H:%M:%S')}",
-        (100, 100, 120),
-        font=ss_font(18),
-        anchor="rm",
-    )
+    now = datetime.now()
+    _draw_background(img, draw, w, h)
+    _draw_header(draw, w, now)
 
     columns = 4
-    block_start_x = 30
-    ox = 210
-    oy = 118
+    ox = CARD_W + CARD_GAP_X
+    oy = CARD_H + CARD_GAP_Y
     data_gz: List[Dict] = data1["data"]["diff"]
 
 
     # 绘制各板块 (流式布局，避免空白)
-    curr_y = 134
+    curr_y = 154
     sections = [
         (data_gz, i_code, "GLOBAL INDICES", (239, 68, 68), None),
         (data2, commodity, "COMMODITIES", (168, 85, 247), "single"),
@@ -211,33 +392,53 @@ async def _draw_future_img_uncached():
             return 0
 
         rows = (len(valid_items) + columns - 1) // columns
-        grid_top = y_start + 8
-        section_bottom = grid_top + 115 + (rows - 1) * oy + 18
+        grid_top = y_start + 64
+        section_bottom = grid_top + CARD_H + (rows - 1) * oy + 20
+        up_count = 0
+        down_count = 0
+        for item in valid_items:
+            _, _, diff, _, _ = _get_future_card_fields(item, block_type)
+            if diff > 0:
+                up_count += 1
+            elif diff < 0:
+                down_count += 1
+        flat_count = len(valid_items) - up_count - down_count
 
         # 绘制分区底板与标题
         draw.rounded_rectangle(
-            [30, y_start - 42, w - 30, section_bottom],
-            radius=10,
-            fill=(11, 13, 18, 225),
-            outline=(255, 255, 255, 16),
+            [SECTION_X, y_start, SECTION_X + SECTION_W, section_bottom],
+            radius=20,
+            fill=(8, 13, 25, 232),
+            outline=(148, 163, 184, 28),
             width=1,
         )
-        draw.rectangle([40, y_start - 28, 46, y_start - 6], fill=accent_color)
-        draw.text((60, y_start - 17), f"{title}", (190, 190, 200), font=ss_font(22), anchor="lm")
+        draw.rounded_rectangle([SECTION_X, y_start, SECTION_X + 7, section_bottom], radius=4, fill=(*accent_color, 180))
+        draw.text((48, y_start + 24), f"{title}", fill=(241, 245, 249), font=ss_font(24), anchor="lm")
         draw.text(
-            (w - 46, y_start - 17),
-            f"{len(valid_items)} ASSETS",
-            (96, 100, 118),
-            font=ss_font(14),
-            anchor="rm",
+            (48, y_start + 48),
+            f"{len(valid_items)} ASSETS · {up_count} UP · {down_count} DOWN · {flat_count} FLAT",
+            fill=(100, 116, 139),
+            font=ss_font(13),
+            anchor="lm",
         )
+
+        draw.rounded_rectangle([w - 208, y_start + 18, w - 44, y_start + 46], radius=14, fill=(2, 6, 23, 190), outline=(*accent_color, 42))
+        draw.text(
+            (w - 126, y_start + 32),
+            f"{len(valid_items)} WATCHED",
+            fill=(203, 213, 225),
+            font=ss_font(13),
+            anchor="mm",
+        )
+        draw.rectangle([48, y_start + 58, w - 48, y_start + 59], fill=(255, 255, 255, 10))
+        draw.rectangle([48, y_start + 58, 48 + min(260, len(valid_items) * 14), y_start + 59], fill=(*accent_color, 150))
 
         index = 0
         for item in valid_items:
-            block = await draw_block(item, block_type) if block_type else await draw_block(item)
+            block = _draw_future_card(item, block_type)
             img.paste(
                 block,
-                (block_start_x + ox * (index % columns), grid_top + oy * (index // columns)),
+                (CARD_START_X + ox * (index % columns), grid_top + oy * (index // columns)),
                 block,
             )
             index += 1
@@ -248,15 +449,16 @@ async def _draw_future_img_uncached():
     for d_list, keys, title, color, b_type in sections:
         height_used = await paste_blocks_dynamic(d_list, keys, curr_y, title, color, b_type)
         if height_used > 0:
-            curr_y += height_used + 46 # 加上间距
+            curr_y += height_used + 18 # 加上间距
 
     # 页脚 (动态位置)
     footer = get_footer()
-    img.paste(footer, (w//2 - footer.width//2, curr_y + 14), footer)
+    img.paste(footer, (w//2 - footer.width//2, curr_y + 22), footer)
 
     # 裁剪图片，去除底部多余空白
-    final_h = min(curr_y + 104, h)
+    final_h = min(curr_y + 112, h)
     img = img.crop((0, 0, w, final_h))
+    img = Image.alpha_composite(Image.new("RGBA", img.size, (2, 6, 23, 255)), img)
 
     res = await convert_img(img)
     return res

@@ -339,3 +339,24 @@ Validation:
 - `python -m py_compile SayuStock/utils/stock/utils.py SayuStock/utils/stock/request.py SayuStock/stock_info/draw_info.py`
 - isolated live Eastmoney trends probe for China midday `2026-05-07` returned Shanghai current turnover `864218308640.0`, same-time diff `-77502786416.0`; Shenzhen current turnover `1118236505408.0`, same-time diff `-20099117344.0`
 - local `draw_info_img()` stub render completed with image size `1700x2860`, elapsed `0.2011s`
+
+## 2026-05-08 all-weather OLED terminal UI refresh
+
+User feedback:
+
+- the `全天候` image works but the previous Gemini-designed UI looked ugly
+
+Fix in this patch:
+
+- redesign only the all-weather rendering layer; keep data fetch, cache, section ordering, and asset coverage unchanged
+- replace the older flat black cards with an OLED-style finance terminal dashboard
+- add a compact header with live time and explicit China color legend: red up, green down
+- draw each section as a darker rounded panel with subtle accent rail, section stats, and asset count pill
+- replace the shared compact cards with purpose-built all-weather cards using tighter spacing, price/diff pill, code, and compact amount labels
+- flatten the final RGBA image over the dark background so grid/glow effects do not leave transparent artifacts
+
+Validation:
+
+- `python -m py_compile SayuStock/stock_info/draw_future.py`
+- local all-weather stub render covered 16 global indices, 14 commodities, 11 bonds/yields, 8 FX pairs, and 4 crypto cards; generated image size `900x2340`, elapsed `0.1516s`
+- preview artifact: `%LOCALAPPDATA%/Temp/sayustock_all_weather_ui_v4_flat.png`
