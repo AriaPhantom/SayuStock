@@ -4,9 +4,9 @@ from typing import Any, Dict, List, Tuple, Union, Optional
 from pathlib import Path
 from datetime import datetime
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from gsuid_core.utils.fonts.fonts import core_font as ss_font
+from gsuid_core.utils.fonts.fonts import core_font
 from gsuid_core.utils.image.convert import convert_img
 
 from .get_jp_data import get_jpy
@@ -15,12 +15,15 @@ from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
 from ..utils.constant import bond, whsc, i_code, commodity
 from ..utils.stock.request import get_gg, get_mtdata
 
+# 字体辅助函数
+def ss_font(size):
+    return ImageFont.truetype(core_font, size)
+
 DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
 FUTURE_IMG_CACHE_SECONDS = 20
 FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
 FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
 
-# 常量定义
 CARD_W, CARD_H = 196, 104
 GAP_X, GAP_Y = 12, 12
 SECTION_W = 852
@@ -43,7 +46,7 @@ def _format_price(v):
 
 def _format_amt(v):
     n = _safe_float(v)
-    if n <= 0: return "LIVE"
+    if n <= 0: return "0"
     for b, s in [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]:
         if n >= b: return f"{n/b:.2f}{s}".rstrip("0").rstrip(".")
     return f"{n:.0f}"
@@ -59,19 +62,18 @@ def _draw_card(item: Dict) -> Image.Image:
     card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
     draw = ImageDraw.Draw(card)
     
-    # 背景与发光
     alpha = int(28 + 42 * min(abs(diff)/5.0, 1.0)) if diff != 0 else 28
     draw.rounded_rectangle([0, 0, CARD_W, CARD_H], radius=16, fill=(*color, alpha))
     draw.rounded_rectangle([2, 2, CARD_W-2, CARD_H-2], radius=14, fill=(9, 14, 25, 250), outline=(*color, 60), width=1)
     
-    # 文字渲染
     draw.text((14, 32), _format_price(price), fill=color, font=ss_font(24), anchor="lm")
     diff_str = f"{'+' if diff > 0 else ''}{diff:.2f}%"
     draw.rounded_rectangle([CARD_W-85, 20, CARD_W-12, 46], radius=12, fill=(*color, 30), outline=(*color, 80))
     draw.text((CARD_W-18, 33), diff_str, fill=color, font=ss_font(16), anchor="rm")
     
     draw.text((14, 66), str(name).split(" (")[0][:10], fill=(230, 235, 245), font=ss_font(18), anchor="lm")
-    draw.text((14, 90), f"AMT {_format_amt(amt)}" if amt > 0 else "LIVE", fill=(100, 120, 140), font=ss_font(12), anchor="lm")
+    amt_str = _format_amt(amt)
+    draw.text((14, 90), f"AMT {amt_str}" if amt_str != "0" else "LIVE", fill=(100, 120, 140), font=ss_font(12), anchor="lm")
     if code: draw.text((CARD_W-14, 90), code, fill=(70, 85, 100), font=ss_font(11), anchor="rm")
     return card
 
@@ -100,7 +102,6 @@ async def draw_future_img():
         if FUTURE_IMG_CACHE and (now - FUTURE_IMG_CACHE[0]).total_seconds() < 20:
             return FUTURE_IMG_CACHE[1]
         
-        # 抓取数据
         d1_raw = await get_mtdata("国际市场")
         d1 = d1_raw.get("data", {}).get("diff", []) if isinstance(d1_raw, dict) else []
         
@@ -114,12 +115,11 @@ async def draw_future_img():
         def safe_dict(r): return r if isinstance(r, dict) else {}
         d2, d3, d4, d5 = [safe_dict(r) for r in results]
         
-        # 绘图
         w, h = 900, 2600
         img = Image.new("RGBA", (w, h), (2, 6, 23, 255))
         draw = ImageDraw.Draw(img)
         
-        # 背景渐变 (优化版)
+        # 背景
         grad = Image.new("RGB", (1, h))
         for y in range(h):
             r = y/h
@@ -131,7 +131,6 @@ async def draw_future_img():
         draw.text((44, 78), "All Weather Monitor", fill=(250, 255, 255), font=ss_font(34), anchor="lm")
         draw.text((w-50, 60), f"LIVE {now.strftime('%H:%M:%S')}", fill=(34, 211, 238), font=ss_font(16), anchor="rm")
 
-        # 分组定义
         sections = [
             ("GLOBAL INDICES", d1, [list(i_code.keys())], (240, 70, 70)),
             ("COMMODITIES", d2, [["伦敦金","伦敦银","伦敦铜"],["COMEX黄金","COMEX白银","COMEX铜"],["WTI原油","布伦特原油","天然气"],["螺纹钢主连","豆粕主连","焦煤主连","生猪主连"]], (170, 90, 250)),
@@ -142,18 +141,18 @@ async def draw_future_img():
 
         curr_y = 150
         for title, source, groups, color in sections:
-            # 提取这组要显示的所有数据
             valid_groups = []
             sec_up, sec_down, sec_total = 0, 0, 0
             
+            items_list = source if isinstance(source, list) else source.values()
             for g in groups:
                 g_items = []
                 for name_to_find in g:
                     found = None
-                    if isinstance(source, dict):
-                        found = source.get(name_to_find)
+                    if isinstance(source, dict) and name_to_find in source:
+                        found = source[name_to_find]
                     else:
-                        for item in source:
+                        for item in items_list:
                             if (item.get("f58") or item.get("f14") or "").split(" (")[0] == name_to_find:
                                 found = item
                                 break
@@ -167,7 +166,6 @@ async def draw_future_img():
             
             if not valid_groups: continue
             
-            # 计算高度并画背景
             rows = sum((len(g)+3)//4 for g in valid_groups)
             sec_h = 70 + rows * (CARD_H + GAP_Y)
             draw.rounded_rectangle([24, curr_y, 876, curr_y + sec_h], 20, fill=(8, 13, 25, 230), outline=(150, 160, 180, 25))
@@ -175,7 +173,6 @@ async def draw_future_img():
             draw.text((48, curr_y + 30), title, fill=(245, 250, 255), font=ss_font(24), anchor="lm")
             draw.text((48, curr_y + 52), f"{sec_total} ASSETS | {sec_up} UP | {sec_down} DOWN", fill=(100, 120, 140), font=ss_font(12), anchor="lm")
             
-            # 画卡片
             card_y = curr_y + 65
             for g in valid_groups:
                 for i, item in enumerate(g):
