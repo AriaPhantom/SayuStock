@@ -90,6 +90,16 @@ async def _get_list_data(symbols_dict: Dict):
             result[name] = item
     return result
 
+async def append_jpy(result: Dict):
+    data = await get_jpy()
+    if data: result.update(data)
+    return result
+
+async def _get_bond_data():
+    res = await _get_list_data(bond)
+    await append_jpy(res)
+    return res
+
 async def draw_future_img():
     global FUTURE_IMG_CACHE, FUTURE_IMG_LOCK
     if FUTURE_IMG_LOCK is None: FUTURE_IMG_LOCK = asyncio.Lock()
@@ -103,7 +113,7 @@ async def draw_future_img():
         
         tasks = [
             _get_list_data(commodity),
-            _get_list_data(bond),
+            _get_bond_data(),
             _get_list_data(whsc),
             get_all_crypto_price()
         ]
