@@ -6,7 +6,7 @@ from datetime import datetime
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-from gsuid_core.utils.fonts.fonts import core_font
+from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
 
 from .get_jp_data import get_jpy
