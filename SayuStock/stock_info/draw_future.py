@@ -111,21 +111,34 @@ def _market_color(diff: float) -> Tuple[int, int, int]:
 
 
 def _draw_background(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
+    # 优化：使用 1 像素条拉伸法绘制渐变，速度提升百倍
     top = (2, 6, 23)
     bottom = (3, 7, 18)
+    gradient = Image.new("RGB", (1, h))
     for y in range(h):
         ratio = y / max(h - 1, 1)
         color = tuple(int(top[i] * (1 - ratio) + bottom[i] * ratio) for i in range(3))
-        draw.line([(0, y), (w, y)], fill=(*color, 255))
+        gradient.putpixel((0, y), color)
+    
+    gradient = gradient.resize((w, h))
+    img.paste(gradient, (0, 0))
 
-    glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    # 优化：缩小尺寸后再进行高斯模糊，大幅降低开销
+    glow_scale = 4
+    glow = Image.new("RGBA", (w // glow_scale, h // glow_scale), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow)
-    glow_draw.ellipse([-160, -120, 340, 250], fill=(14, 165, 233, 34))
-    glow_draw.ellipse([590, -180, 1080, 300], fill=(239, 68, 68, 24))
-    glow_draw.ellipse([230, 540, 760, 1180], fill=(34, 197, 94, 16))
-    glow = glow.filter(ImageFilter.GaussianBlur(58))
+    
+    # 缩放坐标绘制发光圆
+    s = glow_scale
+    glow_draw.ellipse([-160//s, -120//s, 340//s, 250//s], fill=(14, 165, 233, 34))
+    glow_draw.ellipse([590//s, -180//s, 1080//s, 300//s], fill=(239, 68, 68, 24))
+    glow_draw.ellipse([230//s, 540//s, 760//s, 1180//s], fill=(34, 197, 94, 16))
+    
+    glow = glow.filter(ImageFilter.GaussianBlur(58 // s))
+    glow = glow.resize((w, h), resample=Image.Resampling.BILINEAR)
     img.alpha_composite(glow)
 
+    # 绘制网格
     for x in range(0, w, 60):
         draw.line([(x, 0), (x, h)], fill=(255, 255, 255, 5), width=1)
     for y in range(0, h, 60):
@@ -137,7 +150,7 @@ def _draw_header(draw: ImageDraw.ImageDraw, w: int, now: datetime) -> None:
         [24, 22, w - 24, 120],
         radius=22,
         fill=(8, 13, 25, 238),
-        outline=(148, 163, 184, 34),
+        outline=(148, 163, 184, 28),
         width=1,
     )
     draw.rectangle([24, 48, 28, 94], fill=(34, 211, 238, 220))
@@ -306,7 +319,7 @@ async def draw_future_img():
             return cache_result
 
     if FUTURE_IMG_LOCK is None:
-        FUTURE_IMG_LOCK = asyncio.Lock()
+        FUTURE_IMG_LOCK = asyncio.lock()
 
     async with FUTURE_IMG_LOCK:
         now = datetime.now()
@@ -359,50 +372,74 @@ async def _draw_future_img_uncached():
     oy = CARD_H + CARD_GAP_Y
     data_gz: List[Dict] = data1["data"]["diff"]
 
-
-    # 绘制各板块 (流式布局，避免空白)
-    curr_y = 154
-    sections = [
-        (data_gz, i_code, "GLOBAL INDICES", (239, 68, 68), None),
-        (data2, commodity, "COMMODITIES", (168, 85, 247), "single"),
-        (data3, bond, "BONDS & YIELDS", (234, 179, 8), "single"),
-        (data4, whsc, "FOREX", (20, 184, 166), "single"),
-        (data5, CRYPTO_MAP, "CRYPTO", (249, 115, 22), "single"),
+    # --- 资产分组定义 ---
+    # 按照资产的天然属性分组，每组会自动换行对齐
+    commodity_groups = [
+        ["伦敦金", "伦敦银", "伦敦铜"],
+        ["COMEX黄金", "COMEX白银", "COMEX铜"],
+        ["WTI原油", "布伦特原油", "天然气"],
+        ["螺纹钢主连", "豆粕主连", "焦煤主连", "生猪主连"]
+    ]
+    
+    bond_groups = [
+        ["中国30年期国债", "中国10年期国债", "中国2年期国债"],
+        ["美国30年期国债收益率", "美国10年期国债收益率", "美国2年期国债收益率"],
+        ["日本30年期国债收益率", "日本10年期国债收益率", "日本2年期国债收益率"],
+        ["德国10年期国债收益率", "英国10年期国债收益率"]
     ]
 
-    async def paste_blocks_dynamic(data_list: DataLike, keys, y_start, title, accent_color, block_type=None):
+    # 绘制各板块 (流式布局)
+    curr_y = 154
+    sections = [
+        (data_gz, [list(i_code.keys())], "GLOBAL INDICES", (239, 68, 68), None),
+        (data2, commodity_groups, "COMMODITIES", (168, 85, 247), "single"),
+        (data3, bond_groups, "BONDS & YIELDS", (234, 179, 8), "single"),
+        (data4, [list(whsc.keys())], "FOREX", (20, 184, 166), "single"),
+        (data5, [list(CRYPTO_MAP.keys())], "CRYPTO", (249, 115, 22), "single"),
+    ]
+
+    async def paste_blocks_dynamic(data_list: DataLike, groups, y_start, title, accent_color, block_type=None):
         if not data_list:
             return 0
 
-        # 预检查是否有实际内容
+        # 整理所有有效资产数据
         items = data_list.values() if isinstance(data_list, dict) else data_list
-        valid_items = []
-        for d in keys:
-            if isinstance(data_list, dict) and d in data_list:
-                valid_items.append(data_list[d])
-                continue
-            for item in items:
-                name = item.get("f58") or item.get("f14") or ""
-                pure_name = str(name).split(" (")[0]
-                if pure_name == d:
-                    valid_items.append(item)
-                    break
+        all_valid_groups = []
+        total_count = 0
+        up_count, down_count = 0, 0
+        
+        for group in groups:
+            group_items = []
+            for d in group:
+                found = None
+                if isinstance(data_list, dict) and d in data_list:
+                    found = data_list[d]
+                else:
+                    for item in items:
+                        name = item.get("f58") or item.get("f14") or ""
+                        if str(name).split(" (")[0] == d:
+                            found = item
+                            break
+                if found:
+                    group_items.append(found)
+                    total_count += 1
+                    _, _, diff, _, _ = _get_future_card_fields(found, block_type)
+                    if diff > 0: up_count += 1
+                    elif diff < 0: down_count += 1
+            if group_items:
+                all_valid_groups.append(group_items)
 
-        if not valid_items:
+        if not all_valid_groups:
             return 0
 
-        rows = (len(valid_items) + columns - 1) // columns
+        # 计算总行数（每组至少占一行，组内超过 columns 则折行）
+        total_rows = 0
+        for group in all_valid_groups:
+            total_rows += (len(group) + columns - 1) // columns
+        
         grid_top = y_start + 64
-        section_bottom = grid_top + CARD_H + (rows - 1) * oy + 20
-        up_count = 0
-        down_count = 0
-        for item in valid_items:
-            _, _, diff, _, _ = _get_future_card_fields(item, block_type)
-            if diff > 0:
-                up_count += 1
-            elif diff < 0:
-                down_count += 1
-        flat_count = len(valid_items) - up_count - down_count
+        section_bottom = grid_top + total_rows * oy + 10
+        flat_count = total_count - up_count - down_count
 
         # 绘制分区底板与标题
         draw.rounded_rectangle(
@@ -416,46 +453,43 @@ async def _draw_future_img_uncached():
         draw.text((48, y_start + 24), f"{title}", fill=(241, 245, 249), font=ss_font(24), anchor="lm")
         draw.text(
             (48, y_start + 48),
-            f"{len(valid_items)} ASSETS · {up_count} UP · {down_count} DOWN · {flat_count} FLAT",
+            f"{total_count} ASSETS · {up_count} UP · {down_count} DOWN · {flat_count} FLAT",
             fill=(100, 116, 139),
             font=ss_font(13),
             anchor="lm",
         )
 
         draw.rounded_rectangle([w - 208, y_start + 18, w - 44, y_start + 46], radius=14, fill=(2, 6, 23, 190), outline=(*accent_color, 42))
-        draw.text(
-            (w - 126, y_start + 32),
-            f"{len(valid_items)} WATCHED",
-            fill=(203, 213, 225),
-            font=ss_font(13),
-            anchor="mm",
-        )
+        draw.text((w - 126, y_start + 32), f"{total_count} WATCHED", fill=(203, 213, 225), font=ss_font(13), anchor="mm")
         draw.rectangle([48, y_start + 58, w - 48, y_start + 59], fill=(255, 255, 255, 10))
-        draw.rectangle([48, y_start + 58, 48 + min(260, len(valid_items) * 14), y_start + 59], fill=(*accent_color, 150))
 
-        index = 0
-        for item in valid_items:
-            block = _draw_future_card(item, block_type)
-            img.paste(
-                block,
-                (CARD_START_X + ox * (index % columns), grid_top + oy * (index // columns)),
-                block,
-            )
-            index += 1
+        # 分组绘制卡片
+        current_row = 0
+        for group in all_valid_groups:
+            for idx, item in enumerate(group):
+                block = _draw_future_card(item, block_type)
+                local_row = idx // columns
+                local_col = idx % columns
+                img.paste(
+                    block,
+                    (CARD_START_X + ox * local_col, grid_top + oy * (current_row + local_row)),
+                    block,
+                )
+            # 每组结束后，更新行偏移量
+            current_row += (len(group) + columns - 1) // columns
 
-        # 返回占用的高度
         return section_bottom - y_start
 
-    for d_list, keys, title, color, b_type in sections:
-        height_used = await paste_blocks_dynamic(d_list, keys, curr_y, title, color, b_type)
+    for d_list, groups, title, color, b_type in sections:
+        height_used = await paste_blocks_dynamic(d_list, groups, curr_y, title, color, b_type)
         if height_used > 0:
-            curr_y += height_used + 18 # 加上间距
+            curr_y += height_used + 18
 
-    # 页脚 (动态位置)
+    # 页脚
     footer = get_footer()
     img.paste(footer, (w//2 - footer.width//2, curr_y + 22), footer)
 
-    # 裁剪图片，去除底部多余空白
+    # 裁剪
     final_h = min(curr_y + 112, h)
     img = img.crop((0, 0, w, final_h))
     img = Image.alpha_composite(Image.new("RGBA", img.size, (2, 6, 23, 255)), img)
