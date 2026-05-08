@@ -422,42 +422,24 @@ async def _draw_future_img_uncached():
         if not all_valid_groups:
             return 0
 
-        # --- 核心布局计算：物理行隔离 ---
+        # --- 核心布局：固定4列，分组换行 ---
         current_row = 0
         oy = CARD_H + CARD_GAP_Y
         grid_top = y_start + 64
+        cols = 4
+        step_x = CARD_W + CARD_GAP_X
 
-        for group_idx, group in enumerate(all_valid_groups):
-            n = len(group)
-            # 自适应列数：≤4 个资产用 n 列均匀分布，>4 个用 4 列换行
-            if n <= 4:
-                cols = n
-                # 计算组内均匀分布：卡片在 SECTION_W 内居中
-                total_w = cols * CARD_W + (cols - 1) * CARD_GAP_X
-                margin = max(0, SECTION_W - total_w) // 2
-                start_x = CARD_START_X + margin
-                step_x = CARD_W + CARD_GAP_X
-                rows_used = 1
-            else:
-                cols = 4
-                start_x = CARD_START_X
-                step_x = CARD_W + CARD_GAP_X
-                rows_used = (n + cols - 1) // cols
-
+        for group in all_valid_groups:
             for idx, item in enumerate(group):
                 block = _draw_future_card(item, block_type)
-                if n <= 4:
-                    x = start_x + idx * step_x
-                    y = grid_top + oy * (current_row)
-                else:
-                    local_row = idx // cols
-                    local_col = idx % cols
-                    x = start_x + local_col * step_x
-                    y = grid_top + oy * (current_row + local_row)
-                
+                local_row = idx // cols
+                local_col = idx % cols
+                x = CARD_START_X + local_col * step_x
+                y = grid_top + oy * (current_row + local_row)
                 img.paste(block, (x, y), block)
-            
-            # 组间加 1 行空白实现物理隔离
+
+            # 组结束：跳到下一行，组间空一行
+            rows_used = (len(group) + cols - 1) // cols
             current_row += rows_used + 1
 
         section_bottom = grid_top + current_row * oy + 10
