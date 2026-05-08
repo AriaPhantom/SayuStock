@@ -434,7 +434,7 @@ async def _draw_future_img_uncached():
                 cols = n
                 # 计算组内均匀分布：卡片在 SECTION_W 内居中
                 total_w = cols * CARD_W + (cols - 1) * CARD_GAP_X
-                margin = max(0, (SECTION_W - total_w)) // 2
+                margin = max(0, SECTION_W - total_w) // 2
                 start_x = CARD_START_X + margin
                 step_x = CARD_W + CARD_GAP_X
                 rows_used = 1
