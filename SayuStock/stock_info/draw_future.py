@@ -111,7 +111,6 @@ def _market_color(diff: float) -> Tuple[int, int, int]:
 
 
 def _draw_background(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int) -> None:
-    # 优化：使用 1 像素条拉伸法绘制渐变，速度提升百倍
     top = (2, 6, 23)
     bottom = (3, 7, 18)
     gradient = Image.new("RGB", (1, h))
@@ -123,12 +122,10 @@ def _draw_background(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int
     gradient = gradient.resize((w, h))
     img.paste(gradient, (0, 0))
 
-    # 优化：缩小尺寸后再进行高斯模糊，大幅降低开销
     glow_scale = 4
     glow = Image.new("RGBA", (w // glow_scale, h // glow_scale), (0, 0, 0, 0))
     glow_draw = ImageDraw.Draw(glow)
     
-    # 缩放坐标绘制发光圆
     s = glow_scale
     glow_draw.ellipse([-160//s, -120//s, 340//s, 250//s], fill=(14, 165, 233, 34))
     glow_draw.ellipse([590//s, -180//s, 1080//s, 300//s], fill=(239, 68, 68, 24))
@@ -138,7 +135,6 @@ def _draw_background(img: Image.Image, draw: ImageDraw.ImageDraw, w: int, h: int
     glow = glow.resize((w, h), resample=Image.Resampling.BILINEAR)
     img.alpha_composite(glow)
 
-    # 绘制网格
     for x in range(0, w, 60):
         draw.line([(x, 0), (x, h)], fill=(255, 255, 255, 5), width=1)
     for y in range(0, h, 60):
@@ -319,7 +315,7 @@ async def draw_future_img():
             return cache_result
 
     if FUTURE_IMG_LOCK is None:
-        FUTURE_IMG_LOCK = asyncio.lock()
+        FUTURE_IMG_LOCK = asyncio.Lock()
 
     async with FUTURE_IMG_LOCK:
         now = datetime.now()
@@ -367,13 +363,9 @@ async def _draw_future_img_uncached():
     _draw_background(img, draw, w, h)
     _draw_header(draw, w, now)
 
-    columns = 4
-    ox = CARD_W + CARD_GAP_X
-    oy = CARD_H + CARD_GAP_Y
     data_gz: List[Dict] = data1["data"]["diff"]
 
     # --- 资产分组定义 ---
-    # 按照资产的天然属性分组，每组会自动换行对齐
     commodity_groups = [
         ["伦敦金", "伦敦银", "伦敦铜"],
         ["COMEX黄金", "COMEX白银", "COMEX铜"],
@@ -388,7 +380,6 @@ async def _draw_future_img_uncached():
         ["德国10年期国债收益率", "英国10年期国债收益率"]
     ]
 
-    # 绘制各板块 (流式布局)
     curr_y = 154
     sections = [
         (data_gz, [list(i_code.keys())], "GLOBAL INDICES", (239, 68, 68), None),
@@ -402,7 +393,6 @@ async def _draw_future_img_uncached():
         if not data_list:
             return 0
 
-        # 整理所有有效资产数据
         items = data_list.values() if isinstance(data_list, dict) else data_list
         all_valid_groups = []
         total_count = 0
@@ -432,60 +422,41 @@ async def _draw_future_img_uncached():
         if not all_valid_groups:
             return 0
 
-        # 计算总行数（每组至少占一行，组内超过 columns 则折行）
-        total_rows = 0
-        for group in all_valid_groups:
-            total_rows += (len(group) + columns - 1) // columns
-        
-        grid_top = y_start + 64
-        section_bottom = grid_top + total_rows * oy + 10
-        flat_count = total_count - up_count - down_count
-
-        # 绘制分区底板与标题
-        draw.rounded_rectangle(
-            [SECTION_X, y_start, SECTION_X + SECTION_W, section_bottom],
-            radius=20,
-            fill=(8, 13, 25, 232),
-            outline=(148, 163, 184, 28),
-            width=1,
-        )
-        draw.rounded_rectangle([SECTION_X, y_start, SECTION_X + 7, section_bottom], radius=4, fill=(*accent_color, 180))
-        draw.text((48, y_start + 24), f"{title}", fill=(241, 245, 249), font=ss_font(24), anchor="lm")
-        draw.text(
-            (48, y_start + 48),
-            f"{total_count} ASSETS · {up_count} UP · {down_count} DOWN · {flat_count} FLAT",
-            fill=(100, 116, 139),
-            font=ss_font(13),
-            anchor="lm",
-        )
-
-        draw.rounded_rectangle([w - 208, y_start + 18, w - 44, y_start + 46], radius=14, fill=(2, 6, 23, 190), outline=(*accent_color, 42))
-        draw.text((w - 126, y_start + 32), f"{total_count} WATCHED", fill=(203, 213, 225), font=ss_font(13), anchor="mm")
-        draw.rectangle([48, y_start + 58, w - 48, y_start + 59], fill=(255, 255, 255, 10))
-
-        # 分组绘制卡片 (确保物理隔离，每组必起新行)
+        # --- 核心布局计算：物理行隔离 ---
         current_row = 0
+        oy = CARD_H + CARD_GAP_Y
+        grid_top = y_start + 64
+
         for group in all_valid_groups:
-            # 绘制当前组的所有资产
+            # 动态列数：如果这组只有 2 或 3 个，且没有下一行，则平铺
+            # 但为了整齐，我们固定用 4 列，但强制这组占满其所有行
+            cols_to_use = 4
+            group_ox = (SECTION_W - 32) // cols_to_use
+            
             for idx, item in enumerate(group):
                 block = _draw_future_card(item, block_type)
-                # 这组内的行号（0, 1...）和列号（0, 1, 2, 3）
-                group_local_row = idx // columns
-                group_local_col = idx % columns
-                
-                # 绝对行号 = 之前已占用的总行数 + 组内偏移行号
-                absolute_row = current_row + group_local_row
+                local_row = idx // cols_to_use
+                local_col = idx % cols_to_use
                 
                 img.paste(
                     block,
-                    (CARD_START_X + ox * group_local_col, grid_top + oy * absolute_row),
+                    (CARD_START_X + group_ox * local_col, grid_top + oy * (current_row + local_row)),
                     block,
                 )
             
-            # 重要：这组画完后，current_row 必须增加“这组占用的总行数”
-            # 哪怕这组只有 1 个资产，它也占了一整行
-            rows_taken_by_group = (len(group) + columns - 1) // columns
-            current_row += rows_taken_by_group
+            # 这组结束，行号跳转到下一组
+            current_row += (len(group) + cols_to_use - 1) // cols_to_use
+
+        section_bottom = grid_top + current_row * oy + 10
+        flat_count = total_count - up_count - down_count
+
+        draw.rounded_rectangle([SECTION_X, y_start, SECTION_X + SECTION_W, section_bottom], radius=20, fill=(8, 13, 25, 232), outline=(148, 163, 184, 28), width=1)
+        draw.rounded_rectangle([SECTION_X, y_start, SECTION_X + 7, section_bottom], radius=4, fill=(*accent_color, 180))
+        draw.text((48, y_start + 24), f"{title}", fill=(241, 245, 249), font=ss_font(24), anchor="lm")
+        draw.text((48, y_start + 48), f"{total_count} ASSETS · {up_count} UP · {down_count} DOWN · {flat_count} FLAT", fill=(100, 116, 139), font=ss_font(13), anchor="lm")
+        draw.rounded_rectangle([w - 208, y_start + 18, w - 44, y_start + 46], radius=14, fill=(2, 6, 23, 190), outline=(*accent_color, 42))
+        draw.text((w - 126, y_start + 32), f"{total_count} WATCHED", fill=(203, 213, 225), font=ss_font(13), anchor="mm")
+        draw.rectangle([48, y_start + 58, w - 48, y_start + 59], fill=(255, 255, 255, 10))
 
         return section_bottom - y_start
 
@@ -494,11 +465,9 @@ async def _draw_future_img_uncached():
         if height_used > 0:
             curr_y += height_used + 18
 
-    # 页脚
     footer = get_footer()
     img.paste(footer, (w//2 - footer.width//2, curr_y + 22), footer)
 
-    # 裁剪
     final_h = min(curr_y + 112, h)
     img = img.crop((0, 0, w, final_h))
     img = Image.alpha_composite(Image.new("RGBA", img.size, (2, 6, 23, 255)), img)
