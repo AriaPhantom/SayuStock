@@ -140,7 +140,7 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
             logger.info("[SayuStock] 分时成交额端点冷却中，直接使用 clist 快照。")
             return snapshot_amount, 0, None
 
-    URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
+    URL = "http://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
     y = 0
     ya = 0
     success_count = 0
@@ -309,7 +309,7 @@ async def get_vix(vix_name: str):
 
 async def get_single_fig_data(secid: str):
     params = []
-    url = "https://push2.eastmoney.com/api/qt/stock/trends2/get"
+    url = "http://push2.eastmoney.com/api/qt/stock/trends2/get"
     fields1 = ",".join(SINGLE_LINE_FIELDS1)
     fields2 = ",".join(SINGLE_LINE_FIELDS2)
     params.append(("fields1", fields1))
@@ -444,7 +444,7 @@ async def _get_gg(sec_id: str, sec_type: str):
     ]
 
     fields = ",".join(SINGLE_STOCK_FIELDS)
-    url = "https://push2.eastmoney.com/api/qt/stock/get"
+    url = "http://push2.eastmoney.com/api/qt/stock/get"
     logger.info(f"[SayuStock] get_single_fig_data secid: {sec_id}")
     params.append(("secid", sec_id))
     params.append(("fields", fields))
@@ -483,7 +483,7 @@ async def _get_gg_kline(
     start_time: str,
     end_time: str,
 ):
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
     logger.info(f"[SayuStock] get_single_fig_data secid: {sec_id}")
     params = [
         ("fields1", "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"),
