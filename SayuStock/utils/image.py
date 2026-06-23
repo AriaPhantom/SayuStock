@@ -6,6 +6,30 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from playwright.async_api import async_playwright
 
+from gsuid_core.logger import logger
+import sys
+
+async def launch_browser(p, **kwargs):
+    try:
+        return await p.chromium.launch(**kwargs)
+    except Exception as e:
+        logger.warning(f"[SayuStock] Chromium launch failed: {e}. Trying playwright install...")
+        try:
+            install_args = [
+                sys.executable,
+                "-m",
+                "playwright",
+                "install",
+                "chromium",
+            ]
+            proc = await asyncio.create_subprocess_exec(*install_args)
+            await proc.wait()
+            return await p.chromium.launch(**kwargs)
+        except Exception as err:
+            logger.error(f"[SayuStock] Chromium install/relaunch failed: {err}")
+            raise err
+
+
 from gsuid_core.utils.image.convert import convert_img
 
 from ..stock_config.stock_config import STOCK_CONFIG
@@ -31,7 +55,7 @@ async def render_image_by_pw(
         return html_path
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser(p, headless=True)
         if w == 0 or h == 0:
             w = view_port
             h = view_port

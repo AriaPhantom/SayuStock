@@ -35,8 +35,10 @@ XUEQIU_TOKEN = ""
 async def get_token():
     global XUEQIU_TOKEN
     async with async_playwright() as p:
-        # 启动浏览器（默认 Chromium）
-        browser = await p.chromium.launch(
+        # 启动浏览器（包含安装兜底）
+        from .image import launch_browser
+        browser = await launch_browser(
+            p,
             headless=True,
             args=["--disable-blink-features=AutomationControlled"],  # 禁用自动化检测
         )
