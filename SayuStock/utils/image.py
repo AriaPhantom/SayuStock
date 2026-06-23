@@ -141,16 +141,21 @@ async def render_promax_image(
         border_color=glass_border,
     )
 
-    # 加载字体 (尝试加载系统字体)
+    # 加载字体 (尝试从 gsuid_core 载入 MiSans，本地 Windows 则兜底使用微软雅黑)
     try:
-        # Windows 常用字体
-        font_main = ImageFont.truetype("msyhbd.ttc", 60)
-        font_sub = ImageFont.truetype("msyh.ttc", 35)
-        font_price = ImageFont.truetype("arialbd.ttf", 80)
-    except Exception:
-        font_main = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-        font_price = ImageFont.load_default()
+        from gsuid_core.utils.fonts.fonts import core_font
+        font_main = core_font(60)
+        font_sub = core_font(35)
+        font_price = core_font(80)
+    except ImportError:
+        try:
+            font_main = ImageFont.truetype("msyhbd.ttc", 60)
+            font_sub = ImageFont.truetype("msyh.ttc", 35)
+            font_price = ImageFont.truetype("arialbd.ttf", 80)
+        except Exception:
+            font_main = ImageFont.load_default()
+            font_sub = ImageFont.load_default()
+            font_price = ImageFont.load_default()
 
     # 绘制标题
     draw.text((card_margin + 40, card_margin + 35), title, font=font_main, fill=(255, 255, 255))
