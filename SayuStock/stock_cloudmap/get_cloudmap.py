@@ -957,6 +957,7 @@ async def render_image(
         w,
         h,
         _scale,
+        return_bytes=True,
     )
     
     # --- Pro Max 后处理 ---
@@ -981,5 +982,9 @@ async def render_image(
                 )
         except Exception as e:
             logger.error(f"[SayuStock] Pro Max 后处理失败: {e}")
+
+    if isinstance(img, bytes):
+        from gsuid_core.utils.image.convert import convert_img
+        img = await convert_img(img)
 
     return img

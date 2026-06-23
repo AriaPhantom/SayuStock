@@ -49,7 +49,7 @@ def get_ICON():
 
 
 async def render_image_by_pw(
-    html_path: Path, w: int, h: int, _scale: int
+    html_path: Path, w: int, h: int, _scale: int, return_bytes: bool = False
 ) -> Union[str, bytes]:
     if isinstance(html_path, str):
         return html_path
@@ -74,6 +74,8 @@ async def render_image_by_pw(
         await page.wait_for_selector(".plot-container")
         png_bytes = await page.screenshot(type="png")
         await browser.close()
+        if return_bytes:
+            return png_bytes
         return await convert_img(png_bytes)
 
 
