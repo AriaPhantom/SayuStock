@@ -6,6 +6,30 @@ from io import BytesIO
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from playwright.async_api import async_playwright
 
+from gsuid_core.logger import logger
+import sys
+
+async def launch_browser(p, **kwargs):
+    try:
+        return await p.chromium.launch(**kwargs)
+    except Exception as e:
+        logger.warning(f"[SayuStock] Chromium launch failed: {e}. Trying playwright install...")
+        try:
+            install_args = [
+                sys.executable,
+                "-m",
+                "playwright",
+                "install",
+                "chromium",
+            ]
+            proc = await asyncio.create_subprocess_exec(*install_args)
+            await proc.wait()
+            return await p.chromium.launch(**kwargs)
+        except Exception as err:
+            logger.error(f"[SayuStock] Chromium install/relaunch failed: {err}")
+            raise err
+
+
 from gsuid_core.utils.image.convert import convert_img
 
 from ..stock_config.stock_config import STOCK_CONFIG
@@ -25,13 +49,13 @@ def get_ICON():
 
 
 async def render_image_by_pw(
-    html_path: Path, w: int, h: int, _scale: int
+    html_path: Path, w: int, h: int, _scale: int, return_bytes: bool = False
 ) -> Union[str, bytes]:
     if isinstance(html_path, str):
         return html_path
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser(p, headless=True)
         if w == 0 or h == 0:
             w = view_port
             h = view_port
@@ -50,6 +74,8 @@ async def render_image_by_pw(
         await page.wait_for_selector(".plot-container")
         png_bytes = await page.screenshot(type="png")
         await browser.close()
+        if return_bytes:
+            return png_bytes
         return await convert_img(png_bytes)
 
 
@@ -96,14 +122,16 @@ async def render_promax_image(
 
     draw = ImageDraw.Draw(final_img)
 
-    # 颜色配置 (OLED Pro Max)
-    accent_color = (0, 255, 0, 255) if is_up else (255, 59, 48, 255)
-    glass_bg = (255, 255, 255, 30)  # 玻璃质感背景
-    glass_border = (255, 255, 255, 60)
+    # 颜色配置 (OLED Pro Max) - 适配中国股市：红涨绿跌
+    accent_color = (255, 59, 48, 255) if is_up else (34, 197, 94, 255)
+    border_color = (255, 59, 48, 120) if is_up else (34, 197, 94, 120)
+    glass_bg = (30, 30, 35, 255)  # 纯暗色背景，彻底解决透明通道引起的对比度问题
 
     # 1. 绘制顶端 HUD 卡片
     card_h = 180
     card_margin = 40
+
+    # 绘制卡片
     draw_glass_card(
         draw,
         card_margin,
@@ -112,19 +140,25 @@ async def render_promax_image(
         card_h,
         radius=25,
         fill_color=glass_bg,
-        border_color=glass_border,
+        border_color=border_color,
+        border_width=2,
     )
 
-    # 加载字体 (尝试加载系统字体)
+    # 加载字体 (尝试从 gsuid_core 载入 MiSans，本地 Windows 则兜底使用微软雅黑)
     try:
-        # Windows 常用字体
-        font_main = ImageFont.truetype("msyhbd.ttc", 60)
-        font_sub = ImageFont.truetype("msyh.ttc", 35)
-        font_price = ImageFont.truetype("arialbd.ttf", 80)
-    except Exception:
-        font_main = ImageFont.load_default()
-        font_sub = ImageFont.load_default()
-        font_price = ImageFont.load_default()
+        from gsuid_core.utils.fonts.fonts import core_font
+        font_main = core_font(60)
+        font_sub = core_font(35)
+        font_price = core_font(80)
+    except ImportError:
+        try:
+            font_main = ImageFont.truetype("msyhbd.ttc", 60)
+            font_sub = ImageFont.truetype("msyh.ttc", 35)
+            font_price = ImageFont.truetype("arialbd.ttf", 80)
+        except Exception:
+            font_main = ImageFont.load_default()
+            font_sub = ImageFont.load_default()
+            font_price = ImageFont.load_default()
 
     # 绘制标题
     draw.text((card_margin + 40, card_margin + 35), title, font=font_main, fill=(255, 255, 255))
@@ -133,11 +167,11 @@ async def render_promax_image(
     # 绘制价格 (靠右)
     price_text = price
     change_text = f"{'+' if is_up else ''}{change_pct}%"
-    
+
     # 计算价格文本宽度以进行右对齐
     p_w = draw.textlength(price_text, font=font_price)
     c_w = draw.textlength(change_text, font=font_sub)
-    
+
     draw.text((width - card_margin - 40 - p_w, card_margin + 25), price_text, font=font_price, fill=accent_color)
     draw.text((width - card_margin - 40 - c_w, card_margin + 115), change_text, font=font_sub, fill=accent_color)
 

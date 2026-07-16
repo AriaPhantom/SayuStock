@@ -263,38 +263,39 @@ async def to_single_fig(raw_data: Dict):
     full_data = []
     existing_times = {item["datetime"] for item in price_history}
     ARRAY = get_trading_minutes(code_id)
-    
+
     for time in ARRAY:
         if time in existing_times:
             item = next(it for it in price_history if it["datetime"] == time)
             full_data.append(item)
         else:
             full_data.append({"datetime": time, "price": None, "money": 0})
-    
+
     df = pd.DataFrame(full_data)
 
-    # 颜色配置 (Cyberpunk HUD)
-    up_color = "#00FF00"  # Matrix Green
-    down_color = "#FF3B30"  # Neon Red
+    # 颜色配置 (Cyberpunk HUD) - 适配中国股市：红涨绿跌
+    up_color = "#FF3B30"  # Neon Red (上涨)
+    down_color = "#22C55E"  # Green (下跌)
     line_color = "#00FFFF"  # Cyan
     bg_color = "#000000"  # OLED Black
     grid_color = "rgba(255, 255, 255, 0.05)"
 
-    # 计算自适应范围
-    max_price = df["price"].max()
-    min_price = df["price"].min()
-    
+    # 计算自适应范围 (百分比)
+    df["percentage_change"] = ((df["price"] / open_price) - 1) * 100
+
     # 填充缺失值以便计算范围
-    valid_prices = df["price"].dropna()
-    if valid_prices.empty:
+    valid_pcts = df["percentage_change"].dropna()
+    if valid_pcts.empty:
         return ErroText["notOpen"]
-        
-    max_p = valid_prices.max()
-    min_p = valid_prices.min()
-    
-    diff = max(abs(max_p - open_price), abs(min_p - open_price))
-    y_max = open_price + diff * 1.2
-    y_min = open_price - diff * 1.2
+
+    max_pct = valid_pcts.max()
+    min_pct = valid_pcts.min()
+
+    diff_pct = max(abs(max_pct), abs(min_pct))
+    if diff_pct < 0.1:
+        diff_pct = 0.1
+    y_max = diff_pct * 1.2
+    y_min = -diff_pct * 1.2
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -303,13 +304,13 @@ async def to_single_fig(raw_data: Dict):
         row_heights=[0.75, 0.25],
     )
 
-    # 1. 价格面积图 (带渐变效果)
+    # 1. 涨跌幅面积图 (带渐变效果)
     fig.add_trace(
         go.Scatter(
             x=df["datetime"],
-            y=df["price"],
+            y=df["percentage_change"],
             mode="lines",
-            name="Price",
+            name="Change",
             line=dict(width=4, color=line_color),
             fill='tozeroy',
             fillcolor='rgba(0, 255, 255, 0.1)', # 淡淡的青色填充
@@ -318,14 +319,34 @@ async def to_single_fig(raw_data: Dict):
         row=1, col=1,
     )
 
-    # 2. 开盘价水平线
-    fig.add_hline(
-        y=open_price,
-        line=dict(color="rgba(255, 215, 0, 0.5)", width=2, dash="dash"),
+    # 2. 背景红绿阴影 (与对比图保持一致)
+    fig.add_hrect(
+        y0=0,
+        y1=y_max,
+        fillcolor=up_color,
+        opacity=0.05,
+        layer="below",
+        line_width=0,
+        row=1, col=1
+    )
+    fig.add_hrect(
+        y0=y_min,
+        y1=0,
+        fillcolor=down_color,
+        opacity=0.05,
+        layer="below",
+        line_width=0,
         row=1, col=1
     )
 
-    # 3. 量能柱状图
+    # 3. 开盘价水平线 (y=0)
+    fig.add_hline(
+        y=0,
+        line=dict(color="rgba(255, 215, 0, 0.6)", width=2, dash="dash"),
+        row=1, col=1
+    )
+
+    # 4. 量能柱状图
     bar_colors = []
     prices = df["price"].tolist()
     for i in range(len(prices)):
@@ -354,10 +375,12 @@ async def to_single_fig(raw_data: Dict):
     )
 
     fig.update_yaxes(
+        title_text="<b>涨跌幅(%)</b>",
         range=[y_min, y_max],
         showgrid=True,
         gridcolor=grid_color,
         tickfont=dict(size=22),
+        ticksuffix="%",
         row=1, col=1
     )
 
@@ -374,7 +397,7 @@ async def to_single_fig(raw_data: Dict):
         tickfont=dict(size=22),
         row=1, col=1
     )
-    
+
     fig.update_xaxes(
         dtick=30,
         tickfont=dict(size=22),
@@ -957,8 +980,9 @@ async def render_image(
         w,
         h,
         _scale,
+        return_bytes=True,
     )
-    
+
     # --- Pro Max 后处理 ---
     if sector == "single-stock" and isinstance(img, bytes):
         try:
@@ -981,5 +1005,9 @@ async def render_image(
                 )
         except Exception as e:
             logger.error(f"[SayuStock] Pro Max 后处理失败: {e}")
+
+    if isinstance(img, bytes):
+        from gsuid_core.utils.image.convert import convert_img
+        img = await convert_img(img)
 
     return img

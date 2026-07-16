@@ -781,37 +781,16 @@ async def get_dc_token(force_refresh: bool = False, current_token: str = ""):
 async def _fetch_dc_token():
     global DC_TOKEN
     async with async_playwright() as p:
+        from ..image import launch_browser
         try:
-            # Launch Chromium first.
-            browser = await p.chromium.launch(
+            browser = await launch_browser(
+                p,
                 headless=True,
                 args=["--disable-blink-features=AutomationControlled"],
             )
-        except Exception:
-            logger.warning("[SayuStock] Chromium launch failed, trying playwright install...")
-            try:
-                import sys
-
-                install_args = [
-                    sys.executable,
-                    "-m",
-                    "playwright",
-                    "install",
-                    "chromium",
-                ]
-                proc = await asyncio.create_subprocess_exec(*install_args)
-                await proc.wait()
-
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
-                )
-            except Exception as e:
-                logger.error(
-                    "[SayuStock] Chromium install/relaunch failed. "
-                    f"Run `playwright install` manually if needed. Error: {e}"
-                )
-                return ""
+        except Exception as e:
+            logger.error(f"[SayuStock] Chromium launch failed completely: {e}")
+            return ""
 
         context = await browser.new_context(
             user_agent=UA,
