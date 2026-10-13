@@ -2,30 +2,43 @@ from typing import Union
 
 from PIL import Image, ImageDraw
 
+from gsuid_core.logger import logger
 from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
+from gsuid_core.ai_core.trigger_bridge import ai_return
 
 from ..utils.image import get_footer
-from .draw_my_info import DIFF_MAP, TEXT_PATH, draw_bar
-from ..utils.stock.request import get_gg
+from .draw_my_info import DIFF_MAP, TEXT_PATH, draw_bar_from_quote
+from ..utils.market import get_market, is_market_error
+from ..utils.bottom_chrome import layout_bottom_chrome
+from ..utils.market.display import source_footer
 from ..utils.stock.request_utils import get_code_id, get_fund_pos_list
 
 
-async def draw_fund_info(fcode: Union[str, int]):
+async def draw_fund_info(fcode: Union[str, int]) -> str | bytes:
     _code = await get_code_id(str(fcode))
     if _code is None:
         return "基金代码有误，请检查后重新输入~"
 
     dcode = _code[0].split(".")[1]
     fund_data = await get_fund_pos_list(dcode)
-    if fund_data is None or not fund_data["Datas"]:
+    holdings_raw = fund_data.get("Datas") if fund_data is not None else None
+    if not isinstance(holdings_raw, list) or not holdings_raw:
+        return "获取基金持仓数据失败，请稍后再试~"
+    holdings: list[dict[str, object]] = [row for row in holdings_raw if isinstance(row, dict)]
+    if not holdings:
         return "获取基金持仓数据失败，请稍后再试~"
 
-    img = Image.new(
-        "RGBA",
-        (900, 400 + 60 + len(fund_data["Datas"]) * 110),
-        (7, 9, 27),
+    content_bottom = 400 + len(holdings) * 110
+    footer = get_footer()
+    chrome = layout_bottom_chrome(
+        900,
+        content_bottom,
+        font_size=18,
+        footer_w=footer.size[0],
+        footer_h=footer.size[1],
     )
+    img = Image.new("RGBA", (900, chrome.canvas_h), (7, 9, 27))
     img_draw = ImageDraw.Draw(img)
     img_draw.text(
         (450, 355),
@@ -36,23 +49,20 @@ async def draw_fund_info(fcode: Union[str, int]):
     )
 
     all_p = 0.0
-    for index, d in enumerate(fund_data["Datas"]):
-        share_code: str = d["ShareCode"]
-        data = await get_gg(
-            share_code,
-            "single-stock",
-        )
-        percent = f"{d['ShareProportion']}%"
-        if isinstance(data, str):
+    used: list[str | None] = []
+    market = get_market()
+    for index, d in enumerate(holdings):
+        share_code = str(d.get("ShareCode", ""))
+        q = await market.quote(share_code)
+        percent = f"{d.get('ShareProportion', '')}%"
+        if is_market_error(q):
             continue
-        bar = draw_bar(data, _code[0], percent=percent)
-        if isinstance(data["data"]["f170"], str):
-            all_p += 0
-        else:
-            all_p += data["data"]["f170"]
+        used.append(q.provider)
+        bar = draw_bar_from_quote(q, q.symbol.code or share_code, percent=percent)
+        all_p += float(q.change_pct) if q.change_pct is not None else 0.0
         img.paste(bar, (0, 400 + index * 110), bar)
 
-    avg_p = all_p / len(fund_data["Datas"])
+    avg_p = all_p / len(holdings)
     for i in DIFF_MAP:
         if avg_p >= i:
             title_num = DIFF_MAP[i]
@@ -67,12 +77,43 @@ async def draw_fund_info(fcode: Union[str, int]):
         title,
     )
 
-    footer = get_footer()
-    img.paste(
-        footer,
-        (25, img.size[1] - 55),
-        footer,
+    img.paste(footer, (chrome.footer_x, chrome.footer_y), footer)
+    img_draw.text(
+        (24, chrome.source_y),
+        source_footer(*used),
+        (150, 150, 150),
+        ss_font(18),
+        "lm",
     )
 
     res = await convert_img(img)
+
+    # AI 注入：提取基金持仓文本数据
+    _ai_return_fund_info(_code, holdings, all_p)
+
     return res
+
+
+def _ai_return_fund_info(
+    code_info: tuple[str, str, str] | list[str],
+    holdings: list[dict[str, object]],
+    all_p: float,
+) -> None:
+    """从基金持仓数据中提取文本信息，通过 ai_return 返回给 AI 分析"""
+    try:
+        fund_name = code_info[1]
+        fund_code = code_info[0]
+        avg_p = all_p / len(holdings) if holdings else 0.0
+
+        result = f"【{fund_name}({fund_code}) 持仓信息】\n"
+        result += f"持仓数量: {len(holdings)} 只，平均涨跌幅: {avg_p:+.2f}%\n\n"
+        result += "重仓股:\n"
+        for d in holdings[:10]:
+            name = d.get("ShareName", "N/A")
+            code = d.get("ShareCode", "N/A")
+            proportion = d.get("ShareProportion", "N/A")
+            result += f"  {name}({code}): 占比 {proportion}%\n"
+
+        ai_return(result)
+    except Exception as e:
+        logger.warning(f"[SayuStock] ai_return 基金持仓数据提取失败: {e}")

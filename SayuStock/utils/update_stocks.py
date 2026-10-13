@@ -1,192 +1,311 @@
 #!/usr/bin/env python3
-"""
-update_stocks.py — 更新中国 A 股代码-名称及申万行业映射文件
+"""update_stocks.py — 用东财 API 更新中国 A 股代码-名称及行业映射。
 
-修复说明：
-通过构建 申万二级->一级 和 申万三级->二级的 映射树，解决成分股接口返回 "-" 的问题。
+数据源（全部走内置 ``EASTMONEY_REQUESTER``，不依赖 akshare）：
+
+1. ``clist``：``沪深京A`` 全市场分页，拿代码 / 名称 / f100 所属行业
+2. ``sidemenu_new.json`` 行业板块（``type=2``）按 ``flag`` 分三级：
+   ``1`` 一级、``2`` 二级、``3`` 三级；再分别拉成分 ``clist``
+
+输出字段与 ``constant.StockInfo`` 对齐::
+
+    {code: {"name": str, "industry_l1": str, "industry_l2": str, "industry_l3": str}}
 """
+
+from __future__ import annotations
 
 import os
 import sys
 import json
 import time
+import asyncio
 import argparse
+from typing import Any
+from pathlib import Path
 from datetime import datetime
 
 import pandas as pd
-import akshare as ak
+
+# 直跑脚本时补路径并以包身份重入，保证下面只能走相对导入。
+# 本文件：.../plugins/SayuStock/SayuStock/utils/update_stocks.py
+if not __package__:
+    _script_dir = Path(__file__).resolve().parent
+    _plugin_root = _script_dir.parents[1]  # .../plugins/SayuStock（内层 SayuStock 包的父目录）
+    _core_root = next(
+        (p for p in _script_dir.parents if (p / "gsuid_core" / "__init__.py").is_file()),
+        None,
+    )
+    for _p in (_plugin_root, _core_root):
+        if _p is not None:
+            _s = str(_p)
+            if _s not in sys.path:
+                sys.path.insert(0, _s)
+    import runpy
+
+    runpy.run_module("SayuStock.utils.update_stocks", run_name="__main__")
+    raise SystemExit(0)
+
+from gsuid_core.logger import logger  # noqa: E402
+
+from .constant import market_dict
+from .eastmoney import EASTMONEY_REQUESTER
+
+CLIST_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+# 代码 / 名称 / 市场标记 / 所属行业
+CLIST_FIELDS = "f12,f14,f13,f100"
+PAGE_SIZE = 100
+# 行业板块成分拉取时的并发与节流
+INDUSTRY_CONCURRENCY = 6
+INDUSTRY_PAUSE_S = 0.15
+
 
 # ──────────────────────────────────────────────
-# 重试装饰器
+# 东财 clist 分页
 # ──────────────────────────────────────────────
 
 
-def retry(max_attempts=3, delay=3):
-    """简单重试装饰器"""
+def _as_diff_list(data: dict[str, Any]) -> list[dict[str, Any]]:
+    diff = data["diff"] if "diff" in data else []
+    if isinstance(diff, dict):
+        diff = list(diff.values())
+    if not isinstance(diff, list):
+        return []
+    return [x for x in diff if isinstance(x, dict)]
 
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            last_err = None
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    last_err = e
-                    if attempt < max_attempts:
-                        print(f"\n       ⚠️ 第 {attempt} 次失败: {e.__class__.__name__}: {e}")
-                        print(f"       等待 {delay}s 后重试...")
-                        time.sleep(delay)
-            raise last_err
 
-        return wrapper
+def _total_of(data: dict[str, Any]) -> int:
+    raw = data["total"] if "total" in data else 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return 0
 
-    return decorator
+
+async def fetch_clist_pages(
+    fs: str,
+    *,
+    fields: str = CLIST_FIELDS,
+    pz: int = PAGE_SIZE,
+    max_pages: int = 200,
+    fid: str = "f12",
+    label: str = "",
+    quiet: bool = False,
+) -> list[dict[str, Any]]:
+    """按 fs 表达式分页拉取 clist 全量行。"""
+    all_rows: list[dict[str, Any]] = []
+    for pn in range(1, max_pages + 1):
+        params: list[tuple[str, str]] = [
+            ("pz", str(pz)),
+            ("po", "1"),
+            ("np", "1"),
+            ("fltt", "2"),
+            ("invt", "2"),
+            ("fid", fid),
+            ("pn", str(pn)),
+            ("fs", fs),
+            ("fields", fields),
+        ]
+        resp = await EASTMONEY_REQUESTER.stock_request(CLIST_URL, "GET", params=params)
+        if isinstance(resp, int) or not isinstance(resp, dict):
+            logger.warning(f"[update_stocks] clist 失败 {label} pn={pn} resp={resp}")
+            break
+        data = resp["data"] if "data" in resp and isinstance(resp["data"], dict) else {}
+        page = _as_diff_list(data)
+        if not page:
+            break
+        all_rows.extend(page)
+        total = _total_of(data)
+        if not quiet:
+            tag = f" {label}" if label else ""
+            print(
+                f"\r       clist{tag}: 已拉 {len(all_rows)}" + (f"/{total}" if total else ""),
+                end="",
+                flush=True,
+            )
+        if (total > 0 and len(all_rows) >= total) or len(page) < pz:
+            break
+        await asyncio.sleep(0.05)
+    if not quiet and (label or all_rows):
+        print()
+    return all_rows
+
+
+def _board_of_code(code: str) -> str:
+    if code.startswith(("300", "301")):
+        return "创业板"
+    if code.startswith(("688", "689")):
+        return "科创板"
+    if code.startswith(("8", "4")) and len(code) == 6:
+        return "北交所"
+    if code.startswith("002"):
+        return "中小板"
+    return "主板"
+
+
+def _exchange_of_code(code: str) -> str:
+    if code.startswith(("5", "6", "9")):
+        return "SSE"
+    if code.startswith(("8", "4")) and len(code) == 6:
+        return "BSE"
+    return "SZSE"
+
+
+def _norm_code(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text or text in {"nan", "None", "-"}:
+        return ""
+    # 兼容 600519.SH / 1.600519
+    if "." in text:
+        left, right = text.split(".", 1)
+        if left.isdigit() and len(left) <= 2 and right.isdigit():
+            text = right  # 1.600519
+        elif left.isdigit():
+            text = left  # 600519.SH
+        elif right.isdigit():
+            text = right
+        else:
+            text = left
+    text = text.strip()
+    if text.isdigit():
+        return text.zfill(6)
+    return text
+
+
+def _norm_name(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text or text in {"nan", "None", "-"}:
+        return ""
+    return text
+
+
+def _norm_industry(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text or text in {"nan", "None", "-", "null"}:
+        return ""
+    return text
 
 
 # ──────────────────────────────────────────────
-# 数据抓取（基础股票列表）
+# 基础股票列表（沪深京 A）
 # ──────────────────────────────────────────────
 
 
-@retry(max_attempts=3, delay=5)
-def fetch_sse(symbol: str = "主板A股") -> pd.DataFrame:
-    df = ak.stock_info_sh_name_code(symbol=symbol)
-    code_col, name_col = "证券代码", "证券简称"
-    board = "科创板" if symbol == "科创板" else "主板"
-    rows = [
-        {
-            "code": str(r.get(code_col, "")).strip(),
-            "name": str(r.get(name_col, "")).strip(),
-            "exchange": "SSE",
-            "board": board,
-        }
-        for _, r in df.iterrows()
-        if str(r.get(code_col, "")).strip() and str(r.get(code_col, "")).strip() != "nan"
-    ]
-    return pd.DataFrame(rows)
-
-
-@retry(max_attempts=3, delay=5)
-def fetch_szse() -> pd.DataFrame:
-    df = ak.stock_info_sz_name_code(symbol="A股列表")
-    rows = []
-    for _, row in df.iterrows():
-        code_raw = str(row.get("A股代码", "")).strip()
-        code = code_raw.split(".")[0].zfill(6)
-        name = str(row.get("A股简称", "")).strip()
-        if not code or code == "000nan" or not name:
-            continue
-
-        board = "创业板" if code.startswith(("300", "301")) else ("中小板" if code.startswith("002") else "主板")
-        rows.append({"code": code, "name": name, "exchange": "SZSE", "board": board})
-    return pd.DataFrame(rows)
-
-
-@retry(max_attempts=3, delay=5)
-def fetch_bse() -> pd.DataFrame:
-    df = ak.stock_info_bj_name_code()
-    rows = [
-        {
-            "code": str(r.get("证券代码", "")).strip(),
-            "name": str(r.get("证券简称", "")).strip(),
-            "exchange": "BSE",
-            "board": "北交所",
-        }
-        for _, r in df.iterrows()
-        if str(r.get("证券代码", "")).strip() and str(r.get("证券代码", "")).strip() != "nan"
-    ]
-    return pd.DataFrame(rows)
-
-
-def fetch_all_base_stocks() -> tuple:
-    """抓取全部 A 股基础信息"""
-    parts, errors = [], []
-    fetchers = [
-        ("[1/4] 上交所主板", lambda: fetch_sse("主板A股")),
-        ("[2/4] 上交所科创板", lambda: fetch_sse("科创板")),
-        ("[3/4] 深交所", fetch_szse),
-        ("[4/4] 北交所", fetch_bse),
-    ]
-
-    for label, fn in fetchers:
-        print(f"{label}...")
-        try:
-            df = fn()
-            parts.append(df)
-            print(f"       成功获取 {len(df)} 只")
-        except Exception as e:
-            errors.append(f"{label}: {e}")
-            print(f"       ❌ 失败: {e}")
-
-    if not parts:
-        print("\n❌ 所有交易所基础信息均抓取失败，无法继续")
+async def fetch_all_base_stocks() -> tuple[dict[str, str], pd.DataFrame, dict[str, str]]:
+    """抓取全部 A 股：返回 (code→name, 明细 DataFrame, code→f100 行业)。"""
+    fs = market_dict["沪深京A"] if "沪深京A" in market_dict else ("m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048")
+    print("[1/2] 东财 clist 拉取沪深京 A...")
+    rows = await fetch_clist_pages(fs, label="沪深京A", fid="f12")
+    if not rows:
+        print("❌ clist 未返回任何股票，无法继续")
         sys.exit(1)
 
-    all_df = pd.concat(parts, ignore_index=True).drop_duplicates(subset="code", keep="first")
-    return dict(zip(all_df["code"], all_df["name"])), all_df
+    name_map: dict[str, str] = {}
+    f100_map: dict[str, str] = {}
+    detail_rows: list[dict[str, str]] = []
+    for item in rows:
+        code = _norm_code(item["f12"] if "f12" in item else "")
+        name = _norm_name(item["f14"] if "f14" in item else "")
+        if not code or not name:
+            continue
+        ind = _norm_industry(item["f100"] if "f100" in item else "")
+        name_map[code] = name
+        if ind:
+            f100_map[code] = ind
+        detail_rows.append(
+            {
+                "code": code,
+                "name": name,
+                "exchange": _exchange_of_code(code),
+                "board": _board_of_code(code),
+            }
+        )
+
+    detail_df = pd.DataFrame(detail_rows).drop_duplicates(subset="code", keep="first")
+    print(f"       成功获取 {len(name_map)} 只")
+    return name_map, detail_df, f100_map
 
 
 # ──────────────────────────────────────────────
-# 数据抓取（构建申万行业分类树）
+# 行业板块 → 成分股（按 sidemenu flag 分三级）
 # ──────────────────────────────────────────────
 
+SIDEMENU_URL = "https://quote.eastmoney.com/center/api/sidemenu_new.json"
 
-def fetch_sw_industries() -> dict:
-    print("\n[5/5] 开始获取申万行业分类(构建层级树)...")
-    try:
-        # 1. 获取二级行业信息，构建: [二级行业名称 -> 一级行业名称]
-        l2_df = ak.sw_index_second_info()
-        l2_to_l1 = {str(row["行业名称"]).strip(): str(row["上级行业"]).strip() for _, row in l2_df.iterrows()}
 
-        # 2. 获取三级行业信息，构建: [三级代码 -> {"l1": 一级名称, "l2": 二级名称}]
-        l3_df = ak.sw_index_third_info()
-        l3_info_map = {}
-        for _, row in l3_df.iterrows():
-            l3_code = str(row["行业代码"]).strip()
-            l2_name = str(row["上级行业"]).strip()
-            # 查表得出它的一级行业
-            l1_name = l2_to_l1.get(l2_name, "未知")
-            l3_info_map[l3_code] = {"l1": l1_name, "l2": l2_name}
+async def fetch_industry_boards_by_level() -> dict[int, list[tuple[str, str]]]:
+    """sidemenu type=2：flag 1/2/3 → [(板块名, BKxxxx), ...]。"""
+    empty: dict[int, list[tuple[str, str]]] = {1: [], 2: [], 3: []}
+    resp = await EASTMONEY_REQUESTER.stock_request(SIDEMENU_URL)
+    if isinstance(resp, int) or not isinstance(resp, dict):
+        print(f"❌ sidemenu 失败: {resp}")
+        return empty
+    if "bklist" not in resp or not isinstance(resp["bklist"], list):
+        print("❌ sidemenu 无 bklist")
+        return empty
+    by_flag: dict[int, list[tuple[str, str]]] = {1: [], 2: [], 3: []}
+    for item in resp["bklist"]:
+        if not isinstance(item, dict):
+            continue
+        if "type" not in item or item["type"] != 2:
+            continue
+        if "name" not in item or "code" not in item:
+            continue
+        flag_raw = item["flag"] if "flag" in item else 1
+        flag = int(flag_raw) if isinstance(flag_raw, (int, float)) else 1
+        if flag not in by_flag:
+            continue
+        by_flag[flag].append((str(item["name"]), str(item["code"])))
+    return by_flag
 
-        l3_codes = list(l3_info_map.keys())
-    except Exception as e:
-        print(f"❌ 获取申万层级目录失败: {e}")
+
+async def _fill_board_members(boards: list[tuple[str, str]], label: str) -> dict[str, str]:
+    """拉一批板块的成分代码 → 板块名；同股只保留第一次。"""
+    if not boards:
         return {}
+    total = len(boards)
+    print(f"       {label} {total} 个板块，开始拉成分...")
+    industry_map: dict[str, str] = {}
+    sem = asyncio.Semaphore(INDUSTRY_CONCURRENCY)
+    done = 0
+    lock = asyncio.Lock()
 
-    industry_map = {}
-    total = len(l3_codes)
-    print(f"       成功构建行业树。共 {total} 个申万三级行业，开始拉取成分股...")
-
-    @retry(max_attempts=3, delay=2)
-    def _get_cons(symbol):
-        return ak.sw_index_third_cons(symbol=symbol)
-
-    for i, code in enumerate(l3_codes):
-        print(f"\r       正在处理行业 [{i + 1:03d}/{total}] - {code} ", end="", flush=True)
-        try:
-            cons_df = _get_cons(code)
-            if cons_df is None or cons_df.empty:
-                continue
-
-            # 核心修复点：不使用接口返回的可能为 "-" 的列，而是使用我们自己构建的层级树映射
-            mapped_l1 = l3_info_map[code]["l1"]
-            mapped_l2 = l3_info_map[code]["l2"]
-
-            for _, row in cons_df.iterrows():
-                raw_code = str(row.get("股票代码", ""))
-                if not raw_code:
+    async def _one(name: str, code: str) -> None:
+        nonlocal done
+        fs = code if str(code).startswith("b:") else f"b:{code}"
+        async with sem:
+            rows = await fetch_clist_pages(
+                fs,
+                fields="f12,f14",
+                max_pages=50,
+                fid="f3",
+                quiet=True,
+            )
+            for item in rows:
+                stock_code = _norm_code(item["f12"] if "f12" in item else "")
+                if not stock_code:
                     continue
-                # 兼容 600519.SH 这种带后缀的格式
-                stock_code = raw_code.split(".")[0] if "." in raw_code else raw_code
+                if stock_code not in industry_map:
+                    industry_map[stock_code] = name
+            await asyncio.sleep(INDUSTRY_PAUSE_S)
+            async with lock:
+                done += 1
+                print(f"\r       {label}进度 [{done:03d}/{total}] {name[:12]:<12}", end="", flush=True)
 
-                industry_map[stock_code] = {"industry_l1": mapped_l1, "industry_l2": mapped_l2}
-            # 适度休眠防屏蔽
-            time.sleep(0.2)
-        except Exception:
-            pass  # 发生极端异常跳过该行业
-
-    print("\n       ✅ 申万行业数据拉取完成。")
+    await asyncio.gather(*[_one(n, c) for n, c in boards])
+    print(f"\n       ✅ {label}完成，覆盖 {len(industry_map)} 只")
     return industry_map
+
+
+async def fetch_industry_maps() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """分别返回一级 / 二级 / 三级 代码→板块名。"""
+    print("\n[2/2] 东财行业板块菜单（flag=1/2/3）+ 成分...")
+    by_flag = await fetch_industry_boards_by_level()
+    print(f"       一级 {len(by_flag[1])} / 二级 {len(by_flag[2])} / 三级 {len(by_flag[3])}")
+    l1_map = await _fill_board_members(by_flag[1], "一级")
+    l2_map = await _fill_board_members(by_flag[2], "二级")
+    l3_map = await _fill_board_members(by_flag[3], "三级")
+    return l1_map, l2_map, l3_map
 
 
 # ──────────────────────────────────────────────
@@ -194,19 +313,19 @@ def fetch_sw_industries() -> dict:
 # ──────────────────────────────────────────────
 
 
-def save_json(mapping: dict, path: str):
+def save_json(mapping: dict[str, dict[str, str]], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(mapping, f, ensure_ascii=False, indent=2)
     print(f"✅ 已保存 JSON → {path}  ({len(mapping)} 只)")
 
 
-def save_csv(df: pd.DataFrame, path: str):
+def save_csv(df: pd.DataFrame, path: str) -> None:
     df_sorted = df.sort_values("code").reset_index(drop=True)
     df_sorted.to_csv(path, index=False, encoding="utf-8-sig")
     print(f"✅ 已保存 CSV  → {path}  ({len(df_sorted)} 只)")
 
 
-def show_diff(new_mapping: dict, old_path: str):
+def show_diff(new_mapping: dict[str, dict[str, str]], old_path: str) -> None:
     if not os.path.exists(old_path):
         print("⚠️  未找到旧版本文件，跳过对比")
         return
@@ -221,7 +340,7 @@ def show_diff(new_mapping: dict, old_path: str):
     removed = sorted(old_codes - new_codes)
     common = old_codes & new_codes
 
-    changed = []
+    changed: list[str] = []
     for c in common:
         old_val = old_mapping[c]
         new_val = new_mapping[c]
@@ -229,16 +348,21 @@ def show_diff(new_mapping: dict, old_path: str):
         if isinstance(old_val, str):
             if old_val != new_val["name"]:
                 changed.append(f"{c}: {old_val} -> {new_val['name']}")
-        else:
-            changes = []
-            if old_val.get("name") != new_val.get("name"):
-                changes.append(f"名称({old_val.get('name')}->{new_val.get('name')})")
-            if old_val.get("industry_l1") != new_val.get("industry_l1"):
-                changes.append(f"一级({old_val.get('industry_l1')}->{new_val.get('industry_l1')})")
-            if old_val.get("industry_l2") != new_val.get("industry_l2"):
-                changes.append(f"二级({old_val.get('industry_l2')}->{new_val.get('industry_l2')})")
-            if changes:
-                changed.append(f"{c} " + ", ".join(changes))
+            continue
+
+        changes: list[str] = []
+        if old_val.get("name") != new_val.get("name"):
+            changes.append(f"名称({old_val.get('name')}->{new_val.get('name')})")
+        if old_val.get("industry_l1") != new_val.get("industry_l1"):
+            changes.append(f"一级({old_val.get('industry_l1')}->{new_val.get('industry_l1')})")
+        if old_val.get("industry_l2") != new_val.get("industry_l2"):
+            changes.append(f"二级({old_val.get('industry_l2')}->{new_val.get('industry_l2')})")
+        old_l3 = old_val["industry_l3"] if "industry_l3" in old_val else ""
+        new_l3 = new_val["industry_l3"] if "industry_l3" in new_val else ""
+        if old_l3 != new_l3:
+            changes.append(f"三级({old_l3}->{new_l3})")
+        if changes:
+            changed.append(f"{c} " + ", ".join(changes))
 
     print("\n📊 版本对比:")
     print(f"   旧版: {len(old_mapping)} 只")
@@ -254,46 +378,80 @@ def show_diff(new_mapping: dict, old_path: str):
         print()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="更新中国 A 股及行业映射文件")
-    parser.add_argument("-o", "--output", default="chinese_stocks.json", help="输出文件名 (默认: chinese_stocks.json)")
+async def async_main() -> None:
+    parser = argparse.ArgumentParser(description="用东财 API 更新中国 A 股及行业映射文件")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="chinese_stocks.json",
+        help="输出文件名 (默认: chinese_stocks.json)",
+    )
     parser.add_argument("--format", choices=["json", "csv", "both"], default="json", help="输出格式")
     parser.add_argument("--diff", action="store_true", help="与已有文件对比差异")
+    parser.add_argument(
+        "--skip-industry-boards",
+        action="store_true",
+        help="跳过行业板块成分遍历，仅用 clist f100 填行业",
+    )
     args = parser.parse_args()
 
-    # 强制让输出目录与当前 Python 脚本在同一个目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_path = os.path.join(script_dir, args.output)
 
     start = time.time()
-    print(f"🚀 开始抓取 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"🚀 开始抓取（东财 API）— {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
-    # 1. 抓取基础股票数据 (约 5400+ 只)
-    base_mapping, detail_df = fetch_all_base_stocks()
+    # 1. 基础列表
+    base_mapping, detail_df, f100_map = await fetch_all_base_stocks()
 
-    # 2. 抓取申万行业映射树
-    industry_map = fetch_sw_industries()
+    # 2. 行业板块映射（可选）
+    l1_map: dict[str, str] = {}
+    l2_map: dict[str, str] = {}
+    l3_map: dict[str, str] = {}
+    if not args.skip_industry_boards:
+        l1_map, l2_map, l3_map = await fetch_industry_maps()
 
-    # 3. 数据融合
-    final_mapping = {}
+    # 3. 融合：flag 分级优先，缺省退回 clist f100 / 「未知」
+    final_mapping: dict[str, dict[str, str]] = {}
     for code, name in base_mapping.items():
-        ind = industry_map.get(code, {})
-        # 如果能在行业表找到，就用映射的行业；找不到（如北交所新股），填"未知"
+        if code in l1_map:
+            l1 = l1_map[code]
+        elif code in f100_map:
+            l1 = f100_map[code]
+        else:
+            l1 = "未知"
+        if code in l2_map:
+            l2 = l2_map[code]
+        elif code in f100_map:
+            l2 = f100_map[code]
+        else:
+            l2 = l1
+        if code in l3_map:
+            l3 = l3_map[code]
+        else:
+            l3 = l2
         final_mapping[code] = {
             "name": name,
-            "industry_l1": ind.get("industry_l1", "未知"),
-            "industry_l2": ind.get("industry_l2", "未知"),
+            "industry_l1": l1,
+            "industry_l2": l2,
+            "industry_l3": l3,
         }
 
-    # 如果需要导出 CSV，更新 Dataframe
-    detail_df["industry_l1"] = detail_df["code"].map(lambda x: final_mapping[x]["industry_l1"])
-    detail_df["industry_l2"] = detail_df["code"].map(lambda x: final_mapping[x]["industry_l2"])
+    def _industry(code: object, field: str) -> str:
+        if not isinstance(code, str) or not code:
+            return "未知"
+        info = final_mapping.get(code)
+        if info is None:
+            return "未知"
+        return str(info[field])
 
-    # 4. 差异对比
+    detail_df["industry_l1"] = detail_df["code"].map(lambda x: _industry(x, "industry_l1"))
+    detail_df["industry_l2"] = detail_df["code"].map(lambda x: _industry(x, "industry_l2"))
+    detail_df["industry_l3"] = detail_df["code"].map(lambda x: _industry(x, "industry_l3"))
+
     if args.diff:
         show_diff(final_mapping, output_path)
 
-    # 5. 保存文件
     print()
     if args.format in ("json", "both"):
         save_json(final_mapping, output_path)
@@ -301,7 +459,13 @@ def main():
         csv_path = os.path.splitext(output_path)[0] + ".csv"
         save_csv(detail_df, csv_path)
 
-    print(f"\n⏱  耗时: {time.time() - start:.1f}s")
+    known = sum(1 for v in final_mapping.values() if v["industry_l1"] != "未知")
+    print(f"\n📈 行业覆盖: {known}/{len(final_mapping)}")
+    print(f"⏱  耗时: {time.time() - start:.1f}s")
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":

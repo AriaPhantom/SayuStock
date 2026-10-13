@@ -1,0 +1,259 @@
+# 六、模拟盘 papertrade
+
+> **返回主入口**：[`../SKILL.md`](../SKILL.md) · **上一章**：[五](./05-ai-tools-and-agents.md) · **下一章**：[七、配置/数据库/缓存](./07-config-database-cache.md)
+
+用户文档见 `docs/papertrade.md` 与 `stock_papertrade/PAPERTRADE_GUIDE.md`。  
+本章是**开发者视角**。
+
+## 6.1 设计哲学
+
+- **观察型**：用户建盘 / 换策略 / 启停 + 只读查询；**不能**干预 AI 的单笔买卖  
+- **命名账户**：`SayuPaperAccount.name` 唯一，`account_id` 是所有子表的分区键；
+  **盘不绑群**——群只作为播报订阅方存在（`SayuPaperBroadcastTarget`）  
+- **真源 SQLModel**：账户/持仓/流水/决策/快照/候选池/订阅表；**禁止** `record_*` 平行账本  
+- **建账唯一入口**：trigger `send_init_command` / `send_create_account`（幂等）；
+  agent 不直接写半截状态  
+
+## 6.2 模块地图
+
+```
+stock_papertrade/
+├── __init__.py          # ai_alias / KB / gate 注册 + import 子模块
+├── sv.py                # sv_papertrade (pm=3) / watchlist (pm=6) / admin (pm=0)
+├── commands.py          # 用户命令（建盘/改名/删除/启停/策略/订阅/查询）
+├── admin.py             # 清盘 + master 压测（dry-run 用独立临时盘）
+├── permissions.py
+├── account_scope.py     # 盘名归一/校验 + 读写两条账户解析路径 + 写授权
+├── broadcast.py         # 按 account_id 扇出到订阅群（组装可投递 Event）
+├── cross_group.py       # 跨盘排行 / 按盘名或群反查
+├── db.py                # 仓储封装（含 PaperBroadcastRepo）
+├── quote_service.py     # 报价（语义 parse）
+├── trade_executor.py    # 下单执行
+├── matcher.py           # 撮合
+├── strategy.py          # 评分 / 风控参数（**仅测试与 gate 复用，不在生产决策路径**）
+├── strategies/          # 策略包：注册表 + 每策略工具清单 / 硬闸 / Kanban 流程
+├── indicators.py        # 模拟盘侧指标封装
+├── candidate_pool.py    # 候选池
+├── trading_calendar.py  # A 股交易日/时段（数据驱动，见 6.5）
+├── holiday_heal.py      # 假期脏成交自愈/还原（需行情层，不放 utils/database）
+├── proactive.py         # 主动播报等
+├── render.py            # 账户/排行 PIL；持仓简图走 paper_holdings_html
+├── ai_tools.py          # @ai_tools 读写
+└── PAPERTRADE_GUIDE.md  # 注入人格的操作指南
+```
+
+## 6.3 数据表（`utils/database/papertrade_models.py`）
+
+导入副作用：`utils/database/models.py` 会 import papertrade 表 + WebConsole Admin。
+
+| 表（类） | 用途 |
+|----------|------|
+| `SayuPaperAccount` | **一行一个命名盘**：`name`（唯一）、`strategy_id` / `strategy_params`、现金、模式、enabled、Kanban root id… |
+| `SayuPaperPosition` | 持仓（`account_id`） |
+| `SayuPaperTrade` | 成交流水（`account_id`） |
+| `SayuPaperDecision` | 决策日志 / reasoning（`account_id`） |
+| `SayuPaperSnapshot` | 日净值（`account_id`） |
+| `SayuPaperAgentPool` | 候选池（`account_id`） |
+| `SayuPaperWatchlist` | 观察列表（`account_id`） |
+| `SayuPaperBroadcastTarget` | 播报订阅：`account_id` × `group_id`，**必须含 `ws_bot_id` / `bot_self_id`** |
+| `SayuMacroEvent`（`macro_models.py`） | **全局一张**宏观重大事件：`slug` 唯一、`status` open/settled、`severity` 1~5、`direction`、`result`、`last_checked_at`；不按 `account_id` 分区 |
+
+子表里保留的 `group_id` / `bot_id` **只是建盘原群的排障字段**，不参与查询路由。
+
+`ws_bot_id` / `bot_self_id` 不是可选项：`emit_proactive_message` 靠它们找到连接实例并拼
+`session_id`，缺了会投错群或直接投不出去。
+
+WebConsole：`SayuPaper*Admin` 注册到管理后台。
+
+### 迁移（`utils/database/papertrade_migration.py`）
+
+- 加列走框架 `exec_list`（`trans_adapter`，priority `-80`），**失败是静默的**——
+  所以迁移脚本必须自己 `PRAGMA table_info` 复核列在不在，不能假设加成功了
+- 数据回填挂 `@on_core_start_before(priority=-70)`，排在建表(`-90`)/加列(`-80`)之后
+- SQLite 的表级 `UNIQUE (group_id, bot_id)` 是 `sqlite_autoindex_*`，**DROP INDEX 删不掉**，
+  只能读 DDL → 正则剥掉约束 → 建临时表 → 搬数据 → 换名（整个过程一个事务）
+- 全流程幂等；孤儿子表行跳过并告警
+- 启动时再跑 ``heal_orphan_ledger``：删幽灵仓；若现金−流水重算现金≈Σrealized_pnl，判定为旧卖出公式把盈亏加进了现金并更正；回写净值；补空的播报路由。master 也可发 ``模拟盘对账``。
+
+### 假期脏成交自愈（`stock_papertrade/holiday_heal.py`）
+
+放 feature 包而**不是** `utils/database`：它需要行情层回溯历史收盘价，也需要
+撮合层的成本公式。`heal_holiday_trades(dry_run=...)` 挂在 `on_core_start`
+（不是 `on_core_start_before`——要打行情接口，不该阻塞启动），master 可发
+``模拟盘假期还原`` 手动跑（默认预演，加"执行"才真改）。
+
+流程：权威休市表 → 定位 `decided_at` 落在休市日的流水 → **留档 JSON** →
+删流水 → 按留存流水重算现金 / `principal` / 持仓 → 删休市日净值行并重写之后的
+净值链 → 删同窗口的 buy/sell 决策（hold 保留）。
+
+**误删防线是分层的，改判据时必须逐层确认仍然成立**（"今天没开市"是唯一判据，
+判据一旦残缺，删除就从纠错变成灾难）：
+
+| 层 | 位置 | 作用 |
+|----|------|------|
+| 0 | `resolve_closed_days()` | 上证日 K 拿不到 → 整体放弃，**绝不**回落到人工表删数据 |
+| 1 | `refresh_daily_calendar` 密度自检 | 交易日/工作日 < 60% → 判上游残缺，拒绝生成休市表 |
+| 2 | `refresh_daily_calendar` 占比自检 | 推导出的休市日 > 工作日 30% → 判据可疑，拒绝采用 |
+| 3 | `heal_holiday_trades` 熔断 | 脏数据占比 > 30% 或 > 500 笔 → 放弃清理，留给人看 |
+| 4 | 时间戳解析 | 解析不了就跳过该行并 `logger.error` |
+
+实测参考：A 股工作日中约 92%~93% 是交易日，休市占比约 7%~8%——阈值都留了
+足够余量（60% / 30%），正常年份绝不会误触。
+
+离线兜底是 `holidays` 库（`country_holidays("CN")`）按年生成并上静态表，
+已验证覆盖 2026 全部 17 个官方休市工作日。
+
+四条硬约束：
+
+1. **权威休市表拿不到就整体放弃**，绝不回落到人工表删数据
+2. 重算一律调 `matcher.apply_fill_qty_cost` / `cash_delta_for_fill`，
+   **不要**自己写加权成本——线上口径是 `(old_qty*old_avg + buy_qty*price + fee) / new_qty`，
+   手续费在分子且不乘股数
+3. 裸 `text()` 查询回来的 datetime 列是**字符串**；解析失败必须跳过该行并
+   `logger.error`，**绝不能兜底 `now()`**——那会把每笔历史成交标成"今天"，
+   然后把整个账本当脏数据删光
+4. `principal` = 期初 + Σrealized_pnl，`heal_orphan_ledger` **不管**这一列，
+   只有本模块会改它
+
+## 6.4 用户命令
+
+| 命令 | 说明 | 权限 |
+|------|------|------|
+| 模拟盘初始化 [资金] | 建/自愈默认盘 + 挂 Kanban/cron | 群主/管理 |
+| 模拟盘创建 &lt;盘名&gt; [策略id] [资金] | 新建命名盘 | 群主/管理 |
+| 模拟盘改名 / 删除 / 停用 / 启用 | 盘生命周期 | 群主/管理 |
+| 模拟盘策略列表 / 模拟盘策略切换 &lt;盘名&gt; &lt;策略id&gt; | 策略管理（切换会重建心跳树） | 列表任何人 / 切换管理 |
+| 模拟盘推送添加｜删除｜列表 | 当前群订阅/退订某盘的成交播报 | 增删管理 / 列表任何人 |
+| 模拟盘列表 / 查看 &lt;盘名&gt; / 收益 &lt;盘名&gt; / 记录 &lt;盘名&gt; | 只读查询 | 任何人（仍挂管理 SV） |
+| 模拟盘自选 / 持仓 [盘名] | HTML 持仓简图（图例 + 分时）；空盘名=默认盘 | 任何人（``sv_papertrade_watchlist`` pm=6） |
+| 模拟盘排行 / 模拟盘查询 &lt;盘名&gt; | 跨盘排行 / 单盘明细 | 管理 |
+| 模拟盘清盘 &lt;盘名&gt; / 模拟盘对账 / 模拟盘假期还原 [执行] / 模拟盘模拟测试 | 运维 | master（pm=0） |
+| 宏观事件 / 宏观事件刷新 | 查看宏观事件表 / 立即联网复核（`stock_macro/commands.py`） | 任何人 / 管理 |
+
+权限 helpers：`permissions.user_pm_level` / `check_admin`。
+
+针对某个盘的管理 / 查看 / 收益 / 记录命令**必须带盘名**（`_require_named_account`），
+无参只回用法。``模拟盘自选`` / ``模拟盘持仓`` 例外：空盘名回落默认盘。
+
+⚠️ **`on_prefix` 不匹配"只有关键词、没有参数"的消息**（`_check_prefix` 显式排除了
+fullmatch）。带参命令若也想支持裸发（给用法提示），必须**同时**叠一个 `on_fullmatch`；
+`to_ai` 只挂在其中一个上，否则会注册两个同名 AI 工具。
+
+⚠️ 插件级 `force_prefix=["a", "股票"]`：所有命令实际要发 `a模拟盘列表`。端侧联调脚本
+（`test/_manual_ws_client.py`）不带前缀会静默掉进 AI 闲聊兜底，看起来像"命令没注册"。
+
+## 6.5 周期心跳与日历
+
+**日历是数据驱动的，人工假期表只是离线兜底。** 权威判据全在上证指数 `1.000001`
+（必须带市场前缀，裸 `000001` 是平安银行）：
+
+- `refresh_daily_calendar()` → 日 K 里"工作日却无 K 线"的日子 = 权威休市表，落盘
+  `data/papertrade_trading_calendar.json` 的 `closed_days`
+- `refresh_intraday()` → 分时最后一点的日期；休市时返回上一交易日数据，
+  所以"最后一点不是今天"就是今天没开市的确凿证据
+
+**同步 / 异步分工**（`commands._is_market_open_now`、`next_decision_time` 是同步
+调用点，同步 API **只读缓存、绝不发网络**）：
+
+| 函数 | 网络 | 谁在用 |
+|------|------|--------|
+| `is_a_share_trading_day` / `should_run_papertrade` | 否，只读缓存 | 同步命令层 / 日志 |
+| `is_trading_day_async` / `should_run_papertrade_async` | 是，先自证 | recurring gate |
+| `refresh_daily_calendar` / `refresh_intraday` | 是 | `on_core_start` 启动钩子 |
+
+`__init__.py` 注册的 **recurring gate 一律挂 async 版**：非交易日不进
+decision / pool / snapshot。gate 抛异常框架是 fail-open（等于放行交易），
+所以 async 判定位**自己**吞掉探测失败、不向上抛。
+
+⚠️ 开盘 3 分钟内（09:30-09:33 / 13:00-13:03）**不**拿分时判休市——首根分时
+可能还没落地，误判会白白吃掉一个 cron 槽。
+
+- 决策节奏写在建树时的 `recurring_trigger` 快照（现状 `cron:0,30 9-11,13-15 * * 1-5`）；
+  `SayuPaperAccount.frequency_minutes` **不驱动调度**。改代码里的 cron **不会**自动改老盘，
+  必须重建心跳树（换策略 / 启用 / 初始化补挂）才换新间隔。
+
+## 6.6 决策与撮合流水线
+
+```
+宏观定档（macro_event_list + 宏观三问 → 进攻/中性/防御，决定仓位上限）
+      → 候选池 → 行情(quote_service / Port)
+      → 指标(indicators)
+      → 财报/新闻(可选工具)
+      → strategy 评分 (-1~+1) + 风控门 + **宏观硬闸**（多因子 buy 须带 macro_regime/macro_note；
+        表内有 severity≥4 risk_off 事件时不得标进攻）
+      → matcher / trade_executor
+      → db **同一 session** 写流水+现金+持仓（禁止 LLM 并行 upsert 改股数）
+      → 系统侧成交冒泡（非 agent 闲聊；流水失败则不播报、不建仓）
+```
+
+宏观层的代码在 `stock_macro/`（不在本包）：`SayuMacroEvent` 全局表 + `macro_event_*` 工具 +
+`prompts.py`（三问 / 三档 / 速查表，三份代理 prompt 共用）+ APScheduler 定时联网复核
+（08:40 / 12:40 / 20:40，`macro_event_agent`）。`ai_tools._gate_entry` 在 buy 侧把
+`MacroEventRepo.list_open_severe()` 的结果注入 `_macro_severe_*` 内部键，
+`strategy.macro_gate_reason` 据此拒掉与表矛盾的「进攻」。
+
+**生效面**：`PAPERTRADE_DECISION_PROMPT` 与 `decision_tools()` 是 AgentNode 注册期常量，
+重启即对所有老盘生效；`prompt_block` / `research_phases` 是建树快照，只有重建心跳树
+（换策略 / 启用 / 初始化补挂）才更新。改宏观规则优先改 `stock_macro/prompts.py`。
+
+风控参数（单票仓位、日交易次数、止损、回撤熔断、现金缓冲）在 `strategy.py` 按模式
+（平衡/激进/保守）声明；**用户命令不应暴露改参入口**（产品设计）。
+
+> ⚠️ **`strategy.py::score_stock` / `decide_action` 不在生产路径上**——线上决策由
+> 决策代理的 LLM prompt 驱动，这两个函数只有测试和策略硬闸在调。加规则只改
+> `strategy.py` 等于什么都没改。
+
+## 6.7 策略（`strategies/`）
+
+每个策略自己声明：
+
+| 成员 | 作用 |
+|------|------|
+| `extra_tools` / `decision_tools()` | 研究工具 + 共用账本工具。决策代理按这份清单挂工具 |
+| `agent_profile` | Kanban / recurring gate / 写工具白名单 |
+| `kanban_decision_task()` | 建树时的决策子任务全文（含 `research_phases`） |
+| `pool_preference` | 候选池来源权重 |
+| `validate_entry` / `gate_buy` / `gate_sell` | 落库硬闸。量能顶底必须走 `volume_structure` 函数 |
+
+`stock_agent.register_papertrade_agents` 和 `commands._setup_papertrade_kanban_trees`
+**不要再手写**策略工具列表或 Phase 4。加第三套策略：实现子类 → 进 `_REGISTRY`。
+
+内置：`multi_factor`（财报/榜单/新闻工具）/ `volume_extremum`（`papertrade_volume_scan` +
+月K/日K函数，不挂财报榜单）。
+
+## 6.8 账户解析与写授权（`account_scope.py`）
+
+**读路径和写路径用的是两套优先级，别混用**：
+
+- 读（`resolve_account`）：显式 id → 精确盘名 → 唯一模糊匹配 → 默认盘 / 唯一盘；
+  模糊命中多个时返回 None 而不是猜
+- 写（`resolve_account_for_write`）：**只认 `root_task_id` 反查出来的盘**。
+  LLM 传的 `account_name` 只用于一致性校验；没有任务上下文就直接拒写。
+  这样 LLM 报错盘名最多被纠正，不会把 A 盘的成交写到 B 盘
+- `grant_write(account_id)` 是 ContextVar 授权闸（dry-run / 立即决策用），
+  存的是 **account_id 而不是 bool**——否则 dry-run 期间的写会漏到用户真盘上
+
+## 6.9 AI 工具边界
+
+模拟盘工具 `capability_domain="AI模拟盘"`：
+
+- 查询：`account_list` / `account_query` / `position_list` / `trade_list` / `decision_list`…，
+  都接受可选 `account_name`  
+- 写入：仅决策链路与 setup trigger 应调用的 insert/upsert，账户由 `root_task_id` 决定  
+- **stock_agent 研究代理禁止**用通用记忆工具记账  
+
+建账 agent 确认文案**不要**写死「当前 0 持仓 / 现金 100w」——会被 artifact 永久引用；
+实时数字必须查 SQLModel。
+
+## 6.10 改模拟盘 checklist
+
+1. 表结构变更：`papertrade_models.py` 模型 + `exec_list` 加列 + `papertrade_migration.py`
+   回填（并复核列真的加上了）。  
+2. 业务读写只经 `db.py` 的 repository，一律传 `account_id`。  
+3. 新策略：三个生效点都实现 + 进注册表 + 补 `test_papertrade_strategies.py`。  
+4. 日历 gate 与交易时段逻辑单测（`test_papertrade_calendar.py`）。  
+5. 撮合/策略单测（`test_papertrade_matcher.py` / `test_papertrade_strategies.py`）。  
+6. 更新 `PAPERTRADE_GUIDE.md`（人格 RAG）与用户 `docs/papertrade.md`。  
+7. 端侧联调：`uv run core` + `python test/_manual_ws_client.py`（记得带 `a` 前缀、
+   `user_pm=1` 才过 `check_admin`）。  
+8. 不引入第二套持久化。  

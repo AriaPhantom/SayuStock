@@ -5,7 +5,33 @@ from sqlmodel import Field
 from gsuid_core.webconsole.mount_app import PageSchema, GsAdminModel, site
 from gsuid_core.utils.database.base_models import Bind, Type, T_Bind
 
+# 导入即注册「去群主键」迁移钩子（on_core_start_before priority=-70，
+# 排在框架的 exec_list 迁移 -80 之后）
+from . import papertrade_migration  # noqa: F401,E402
 from ..utils import convert_list
+
+# 宏观重大事件表（全局一张；新表由 create_all 自动建，老库零迁移）
+from .macro_models import SayuMacroEvent, SayuMacroEventAdmin  # noqa: F401
+
+# 导入 模拟盘 8 张表 + WebConsole 注册
+from .papertrade_models import (  # noqa: F401
+    SayuPaperTrade,
+    SayuPaperAccount,
+    SayuPaperDecision,
+    SayuPaperPosition,
+    SayuPaperSnapshot,
+    SayuPaperAgentPool,
+    SayuPaperWatchlist,
+    SayuPaperTradeAdmin,
+    SayuPaperAccountAdmin,
+    SayuPaperDecisionAdmin,
+    SayuPaperPositionAdmin,
+    SayuPaperSnapshotAdmin,
+    SayuPaperAgentPoolAdmin,
+    SayuPaperWatchlistAdmin,
+    SayuPaperBroadcastTarget,
+    SayuPaperBroadcastTargetAdmin,
+)
 
 
 class SsBind(Bind, table=True):
@@ -25,6 +51,11 @@ class SsBind(Bind, table=True):
         uid: str,
         game_name: Optional[str] = None,
     ) -> int:
+        """删除一只自选。
+
+        uid 列为 NOT NULL：删到空时不能 update 成 None，改为删除整行。
+        无自选时再「添加自选」会走 insert_uid 新建行。
+        """
         result = await cls.get_uid_list_by_game(user_id, bot_id, game_name)
         if result is None:
             return -1
@@ -43,8 +74,10 @@ class SsBind(Bind, table=True):
         result = [i for i in result if i] if result else []
         new_uid = "_".join(result)
 
+        # 空列表：整行删除，避免 NOT NULL 约束报错
         if not new_uid:
-            new_uid = None
+            await cls.delete_row(user_id=user_id, bot_id=bot_id)
+            return 0
 
         await cls.update_data(
             user_id,
@@ -60,7 +93,7 @@ class SsPushAdmin(GsAdminModel):
     page_schema = PageSchema(
         label="股票自选管理",
         icon="fa fa-bullhorn",
-    )  # type: ignore
+    )
 
     # 配置管理模型
     model = SsBind

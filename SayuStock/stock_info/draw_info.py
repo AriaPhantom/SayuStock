@@ -1,19 +1,82 @@
 import asyncio
-from typing import Dict, List, Tuple, cast
+from typing import Dict, List, Tuple
 from pathlib import Path
 from datetime import datetime
 
 from PIL import Image, ImageOps, ImageDraw
 
+from gsuid_core.logger import logger
 from gsuid_core.utils.fonts.fonts import core_font as ss_font
 from gsuid_core.utils.image.convert import convert_img
+from gsuid_core.ai_core.trigger_bridge import ai_return
 
 from ..utils.image import get_footer
 from ..utils.utils import number_to_chinese
-from ..utils.stock.request import get_gg, get_bar, get_mtdata, get_hours_from_em
+from ..utils.market import (
+    BREADTH_BANDS,
+    BREADTH_DIRECTION,
+    Quote,
+    BreadthBar,
+    DisplayItem,
+    get_market,
+    breadth_counts,
+    breadth_up_down,
+    is_market_error,
+    board_rows_to_items,
+)
+from ..utils.bottom_chrome import layout_bottom_chrome
+from ..utils.market.models import BoardSnapshot, BreadthBucket, MarketTurnover
+from ..utils.market.display import source_label
 from ..utils.stock.request_utils import get_image_from_em
 
 TEXT_PATH = Path(__file__).parent / "texture2d"
+
+# 概览图涨跌分布柱几何（div.png 内坐标系，画布 850×500）：
+# 首柱左缘 / 柱宽固定，末柱右缘恒定，柱间距按实际档位数自算。
+# 12 档时间距正好是原来的 66px（45 + 11×66 + 36 = 807），分档增删后
+# 也不会再把最后一根柱连同家数标签画出画布（13 档时原实现右缘到 873）。
+_BREADTH_BAR_LEFT = 45
+_BREADTH_BAR_WIDTH = 36
+_BREADTH_BAR_RIGHT = 807
+
+# 方向 → 柱色：涨红、跌绿、平灰。方向由 BREADTH_DIRECTION 单点给出，
+# 不再按「第几根柱」对半切（那是 12 档时代的写法，插入「平」之后会错色）。
+_BREADTH_DIRECTION_COLORS: Dict[int, Tuple[int, int, int]] = {
+    1: (187, 26, 26),
+    0: (150, 150, 150),
+    -1: (23, 199, 30),
+}
+_BREADTH_BAR_COLORS: Dict[str, Tuple[int, int, int]] = {
+    label: _BREADTH_DIRECTION_COLORS[direction] for label, direction in BREADTH_DIRECTION.items()
+}
+
+# 主要指数按代码报价。行情中心「涨跌幅前 100」里没有上证/沪深300。
+_OVERVIEW_INDEXES: tuple[tuple[str, str], ...] = (
+    ("上证指数", "1.000001"),
+    ("中证全指", "1.000985"),
+    ("创业板指", "0.399006"),
+    ("科创综指", "1.000680"),
+    ("沪深300", "1.000300"),
+    ("中证500", "1.000905"),
+    ("中证1000", "1.000852"),
+    ("中证2000", "2.932000"),
+    ("中证A500", "1.000510"),
+    ("北证50", "0.899050"),
+)
+_OVERVIEW_OPTIONAL: tuple[tuple[str, str], ...] = (
+    ("黄金9999", "118.AU9999"),
+    ("三十债主连", "220.TLM"),
+)
+
+
+def breadth_bar_left(index: int, total: int) -> int:
+    """分布柱左缘 x：index 从 0 起（0 = 跌停侧），末柱右缘恒为 _BREADTH_BAR_RIGHT。"""
+    if total < 2:
+        return _BREADTH_BAR_LEFT
+    span = _BREADTH_BAR_RIGHT - _BREADTH_BAR_WIDTH - _BREADTH_BAR_LEFT
+    return round(_BREADTH_BAR_LEFT + index * span / (total - 1))
+
+
 DIFF_MAP = {
     3.3: "1",
     2.7: "2",
@@ -28,26 +91,29 @@ DIFF_MAP = {
 }
 
 
-def remove_color_range(img: Image.Image, lower_bound, upper_bound):
-    datas = img.getdata()
-
-    new_data = []
-    for item in datas:
-        # 检查像素是否在颜色范围内
-        if (
-            lower_bound[0] <= item[0] <= upper_bound[0]
-            and lower_bound[1] <= item[1] <= upper_bound[1]
-            and lower_bound[2] <= item[2] <= upper_bound[2]
-        ):
-            new_data.append((255, 255, 255, 0))
-        else:
-            new_data.append(item)
+def remove_color_range(
+    img: Image.Image,
+    lower_bound: tuple[int, int, int],
+    upper_bound: tuple[int, int, int],
+) -> Image.Image:
+    # Pillow 12 的像素是元组或 float，先收窄再按下标抠近白底。
+    new_data: list[tuple[int, ...]] = []
+    for item in img.get_flattened_data():
+        if isinstance(item, tuple) and len(item) >= 3:
+            matched = (
+                lower_bound[0] <= item[0] <= upper_bound[0]
+                and lower_bound[1] <= item[1] <= upper_bound[1]
+                and lower_bound[2] <= item[2] <= upper_bound[2]
+            )
+            new_data.append((255, 255, 255, 0) if matched else item)
+        elif isinstance(item, (int, float)):
+            new_data.append((int(item),))
 
     img.putdata(new_data)
     return img
 
 
-def invert_colors(img: Image.Image):
+def invert_colors(img: Image.Image) -> Image.Image:
     r, g, b, a = img.split()
 
     rgb = Image.merge("RGB", (r, g, b))
@@ -78,7 +144,7 @@ def calculate_alpha(diff: float) -> Tuple[int, int, int, int]:
 
     if diff >= 0.1:
         return (185, 0, 6, alpha)
-    elif diff <= -0.1:
+    elif diff <= 0.1:
         return (59, 140, 18, alpha)
 
     return (41, 41, 41, 200)
@@ -104,174 +170,120 @@ def calculate_gradient_rgb_from_gray(diff: float) -> tuple[int, int, int, int]:
     return r, g, b, 150
 
 
-async def draw_block(zs_diff: Dict, _type: str = "diff"):
-    if _type == "single":
-        zs_diff["f14"] = zs_diff["f58"]
-        zs_diff["f3"] = zs_diff["f170"]
-        zs_diff["f6"] = zs_diff["f48"]
-        zs_diff["f2"] = zs_diff["f43"]
-        zs_diff["f100"] = "-"
+async def draw_block(item: DisplayItem, _type: str = "diff") -> Image.Image:
+    """绘制指数/标的块（语义 DisplayItem）。"""
+    name_s = item.name
+    price_s = item.price
+    diff = round(float(item.change_pct), 2)
 
-    diff_val = zs_diff.get("f3", 0)
-    if isinstance(diff_val, (str, type(None))):
-        diff_val = 0
-    diff = round(float(diff_val), 2)
-
-    # 紧凑型 Block 尺寸 (V3 Data-Rich)
-    w, h = 210, 115 
-    zs_img = Image.new("RGBA", (w, h))
+    zs_img = Image.new("RGBA", (200, 140))
     zs_draw = ImageDraw.Draw(zs_img)
-
-    # 颜色与强度计算
-    is_up = diff > 0
-    is_down = diff < 0
-    intensity = min(abs(diff) / 5.0, 1.0) # 5% 涨跌即满强度
-    if is_up:
-        base_color = (239, 68, 68)
-        glow_color = (239, 68, 68, int(40 * intensity))
-    elif is_down:
-        base_color = (34, 197, 94)
-        glow_color = (34, 197, 94, int(40 * intensity))
+    if diff >= 0:
+        zsc = calculate_gradient_rgb_from_gray(diff)
+        zsc2 = (206, 34, 30)
     else:
-        base_color = (96, 100, 118)
-        glow_color = (96, 100, 118, 0)
-        
-    accent_color = (*base_color, 255)
-    glass_bg = (15, 16, 22, 240) 
+        zsc = calculate_gradient_rgb_from_gray(diff)
+        zsc2 = (36, 206, 30)
 
-    # 1. 绘制背景与强度发光
-    zs_draw.rounded_rectangle([2, 2, w-2, h-2], radius=4, fill=glow_color)
-    zs_draw.rounded_rectangle([5, 5, w-5, h-5], radius=4, fill=glass_bg, outline=(255,255,255,20), width=1)
-    
-    # 顶部装饰线
-    zs_draw.rectangle([5, 5, w-5, 8], fill=accent_color)
+    zs_draw.rounded_rectangle((15, 13, 185, 127), 0, zsc)
 
-    # 字体
-    try:
-        f_name = ss_font(20)
-        f_price = ss_font(24)
-        f_diff = ss_font(18)
-        f_meta = ss_font(14)
-    except:
-        f_name = f_price = f_diff = f_meta = ImageFont.load_default()
+    t_font = ss_font(24)
+    name = name_s
+    if len(name) >= 15:
+        name = name[:6]
+    elif len(name) >= 10:
+        t_font = ss_font(18)
 
-    name = zs_diff["f14"]
-    if len(name) > 8: name = name[:7] + "."
-    
-    code = str(zs_diff.get("f12", ""))
-    price = str(zs_diff.get("f2", "-"))
-    amount = zs_diff.get("f6", "-")
-    if isinstance(amount, (int, float)):
-        amount_str = number_to_chinese(amount)
-    else:
-        amount_str = str(amount)
-
-    # 2. 布局数据
-    # 价格 (大)
-    zs_draw.text((w//2, 32), price, accent_color, font=f_price, anchor="mm")
-    
-    # 涨跌幅 (带符号)
-    diff_str = f"{'+' if is_up else ''}{diff}%"
-    zs_draw.text((w//2, 58), diff_str, accent_color, font=f_diff, anchor="mm")
-    
-    # 成交额 (新加)
-    if amount_str != "-":
-        zs_draw.text((w//2, 78), f"额 {amount_str}", (120, 120, 130), font=f_meta, anchor="mm")
-    
-    # 底部名称与代码
-    zs_draw.text((w//2, 98), name, (200, 200, 200), font=f_name, anchor="mm")
-    if code and code != "None":
-        zs_draw.text((w-10, h-15), code, (80, 80, 80), font=f_meta, anchor="rm")
-
+    zs_draw.text((100, 99), name, (255, 255, 255), t_font, "mm")
+    zs_draw.text((100, 38), f"{price_s}", zsc2, ss_font(30), "mm")
+    zs_draw.text((100, 70), f"{'+' if diff >= 0 else ''}{diff}%", zsc2, ss_font(30), "mm")
     return zs_img
 
 
-async def draw_info_img(is_save: bool = False):
-    tasks = [
-        get_mtdata("主要指数", pz=100),
-        get_mtdata("行业板块", po=1),
-        get_mtdata("行业板块", po=0),
-        get_mtdata("概念板块", po=1),
-        get_mtdata("概念板块", po=0),
-        get_gg("118.AU9999", "single-stock"),
-        get_gg("220.TLM", "single-stock"),
-        get_bar(),
-    ]
+def _overview_item(label: str, quote: Quote) -> DisplayItem:
+    change = float(quote.change_pct) if quote.change_pct is not None else 0.0
+    return DisplayItem(
+        name=label,
+        price=float(quote.price),
+        change_pct=change,
+        amount=quote.amount,
+        code=quote.symbol.code,
+    )
 
-    results = await asyncio.gather(*tasks)
 
-    for index, result in enumerate(results):
-        if isinstance(result, str) and index not in (5, 6):
-            return result
+def _empty_breadth() -> BreadthBar:
+    buckets = tuple(BreadthBucket(label=label, count=0) for label in BREADTH_BANDS)
+    return BreadthBar(buckets=buckets)
 
-    (
-        data_zs,
-        data_hy_z,
-        data_hy_f,
-        data_gn_z,
-        data_gn_f,
-        data_au,
-        data_tlm,
-        bars,
-    ) = results
 
-    data_zs = cast(Dict, data_zs)
-    data_hy_z = cast(Dict, data_hy_z)
-    data_hy_f = cast(Dict, data_hy_f)
-    data_gn_z = cast(Dict, data_gn_z)
-    data_gn_f = cast(Dict, data_gn_f)
-    bars = cast(Dict, bars)
-
-    data_hy_z = data_hy_z["data"]["diff"]
-    data_hy_f = data_hy_f["data"]["diff"]
-    data_gn_z = data_gn_z["data"]["diff"]
-    data_gn_f = data_gn_f["data"]["diff"]
-
-    extra_index_data = []
-    for single_data in (data_au, data_tlm):
-        if isinstance(single_data, str):
+async def draw_info_img(is_save: bool = False) -> str | bytes:
+    market = get_market()
+    index_queries = [secid for _, secid in (*_OVERVIEW_INDEXES, *_OVERVIEW_OPTIONAL)]
+    results = await asyncio.gather(
+        market.quotes(index_queries),
+        market.board("行业板块", limit=20, sort_asc=False),
+        market.board("行业板块", limit=20, sort_asc=True),
+        market.board("概念板块", limit=20, sort_asc=False),
+        market.board("概念板块", limit=20, sort_asc=True),
+        market.breadth(),
+    )
+    quote_rows, hy_z_r, hy_f_r, gn_z_r, gn_f_r, bar_r = results
+    labels = [label for label, _ in (*_OVERVIEW_INDEXES, *_OVERVIEW_OPTIONAL)]
+    data_zs_items: list[DisplayItem] = []
+    index_providers: list[str | None] = []
+    index_errors: list[str] = []
+    optional_names = {label for label, _ in _OVERVIEW_OPTIONAL}
+    if not isinstance(quote_rows, list):
+        return "主要指数数据异常"
+    for label, quote in zip(labels, quote_rows, strict=True):
+        if isinstance(quote, Quote):
+            data_zs_items.append(_overview_item(label, quote))
+            index_providers.append(quote.provider)
             continue
+        if is_market_error(quote):
+            if label in optional_names:
+                logger.warning(f"[SayuStock] 大盘概览{label}报价跳过: {quote.message}")
+            else:
+                index_errors.append(f"{label}: {quote.message}")
+    if not any(item.name not in optional_names for item in data_zs_items):
+        detail = "；".join(index_errors) if index_errors else "无报价"
+        return f"主要指数报价失败：{detail}"
+    for result in (hy_z_r, hy_f_r, gn_z_r, gn_f_r):
+        if is_market_error(result):
+            return result.message
+    if not isinstance(hy_z_r, BoardSnapshot) or not isinstance(hy_f_r, BoardSnapshot):
+        return "行业板块数据异常"
+    if not isinstance(gn_z_r, BoardSnapshot) or not isinstance(gn_f_r, BoardSnapshot):
+        return "概念板块数据异常"
 
-        single_diff: Dict = single_data["data"]
-        single_diff["f14"] = single_diff["f58"]
-        single_diff["f3"] = single_diff["f170"]
-        single_diff["f6"] = single_diff["f48"]
-        single_diff["f2"] = single_diff["f43"]
-        single_diff["f100"] = "-"
-        extra_index_data.append(single_diff)
+    data_hy_z = board_rows_to_items(hy_z_r.rows)
+    data_hy_f = board_rows_to_items(hy_f_r.rows)
+    data_gn_z = board_rows_to_items(gn_z_r.rows)
+    data_gn_f = board_rows_to_items(gn_f_r.rows)
+    breadth_provider: str | None = None
+    if is_market_error(bar_r):
+        logger.warning(f"[SayuStock] 大盘概览涨跌分布跳过: {bar_r.message}")
+        bar_r = _empty_breadth()
+    elif isinstance(bar_r, BreadthBar):
+        breadth_provider = bar_r.provider
+    else:
+        bar_r = _empty_breadth()
+    # breadth_counts 已按 BREADTH_BANDS 补全并按该序输出，渲染端直接画
+    diff_bar: Dict[str, int] = dict(breadth_counts(bar_r))
+    up_value, down_value = breadth_up_down(diff_bar)
+    _ai_return_market_overview(data_zs_items, data_hy_z, data_hy_f, up_value, down_value, diff_bar)
 
-    data_zs["data"]["diff"].extend(extra_index_data)
-
-    zf: List[int] = bars["2"]
-    df: List[int] = bars["3"]
-    diff_bar: Dict[str, int] = {
-        "10+": bars["5"],
-        "5~10": zf[5] + zf[6] + zf[7] + zf[8] + zf[9],
-        "3~5": zf[3] + zf[4],
-        "2~3": zf[2],
-        "1~2": zf[1],
-        "0~1": zf[0],
-        # '0': bars['4'],
-        "0~-1": df[0],
-        "-1~-2": df[1],
-        "-2~-3": df[2],
-        "-3~-5": df[3] + df[4],
-        "-5~-10": df[5] + df[6] + df[7] + df[8] + df[9],
-        "-10+": bars["6"],
-    }
-    up_value = (
-        diff_bar["0~1"] + diff_bar["1~2"] + diff_bar["2~3"] + diff_bar["3~5"] + diff_bar["5~10"] + diff_bar["10+"]
-    )
-    down_value = (
-        diff_bar["0~-1"]
-        + diff_bar["-1~-2"]
-        + diff_bar["-2~-3"]
-        + diff_bar["-3~-5"]
-        + diff_bar["-5~-10"]
-        + diff_bar["-10+"]
-    )
     h0 = 90
-    h = 1060 + 20 * h0
+    content_bottom = 980 + 20 * h0
+    footer = get_footer()
+    chrome = layout_bottom_chrome(
+        1700,
+        content_bottom,
+        font_size=24,
+        footer_w=footer.size[0],
+        footer_h=footer.size[1],
+    )
+    h = chrome.canvas_h
     img = Image.new("RGBA", (1700, h), (7, 9, 27))
     img_draw = ImageDraw.Draw(img)
 
@@ -280,54 +292,22 @@ async def draw_info_img(is_save: bool = False):
     bar3 = Image.open(TEXT_PATH / "bar3.png")
     bar4 = Image.open(TEXT_PATH / "bar4.png")
 
-    zyzs = [
-        "上证指数",
-        "中证全指",
-        "创业板指",
-        "科创综指",
-        "沪深300",
-        "中证500",
-        "中证1000",
-        "中证2000",
-        "中证A500",
-        "北证50",
-        # '上证50',
-        # '国债指数',
-        "黄金9999",
-        "三十债主连",
-    ]
-
-    # 主要指数
     n = 0
-    qz_diff = 0
-    sz_diff = 0
+    qz_diff = 0.0
+    sz_diff = 0.0
+    for item in data_zs_items:
+        if item.name == "中证全指":
+            qz_diff = item.change_pct
+        if item.name == "上证指数":
+            sz_diff = item.change_pct
+        zs_img = await draw_block(item)
+        img.paste(zs_img, (25 + 200 * (n % 4), 440 + 140 * (n // 4)), zs_img)
+        n += 1
 
-    for zs_name in zyzs:
-        for zs_diff in data_zs["data"]["diff"]:
-            diff_name: str = zs_diff["f14"]
-            diff_name = diff_name.split("(")[0].strip()
-
-            if zs_name != diff_name:
-                continue
-
-            zs_diff["f14"] = zs_name
-
-            if diff_name == "中证全指":
-                qz_diff = zs_diff["f3"]
-
-            if diff_name == "上证指数":
-                sz_diff = zs_diff["f3"]
-
-            zs_img = await draw_block(zs_diff)
-
-            img.paste(
-                zs_img,
-                (25 + 200 * (n % 4), 440 + 140 * (n // 4)),
-                zs_img,
-            )
-            n += 1
-
-    img_draw.rectangle((16, 434, 834, 584), None, (246, 180, 0), 5)
+    if n > 0:
+        # 卡片 140px，首行顶在 440；框住全部指数行，不要只圈第一行
+        rows = (n + 3) // 4
+        img_draw.rectangle((16, 434, 834, 440 + rows * 140 + 4), None, (246, 180, 0), 5)
 
     # 分布统计
     div = Image.open(TEXT_PATH / "div.png")
@@ -358,22 +338,18 @@ async def draw_info_img(is_save: bool = False):
         ss_font(24),
         "mm",
     )
-    for dindex, ij_num in enumerate(diff_bar.values().__reversed__()):
-        if dindex <= 5:
-            color = (23, 199, 30)
-        else:
-            color = (187, 26, 26)
-
+    bands = list(diff_bar.items())[::-1]
+    for dindex, (band, ij_num) in enumerate(bands):
         if ij_num == 0:
             continue
-        offset = dindex * 66
+        left = breadth_bar_left(dindex, len(bands))
         lenth = int(max_h * ij_num / max_num)
         div_draw.rectangle(
-            (45 + offset, 413 - lenth, 81 + offset, 413),
-            color,
+            (left, 413 - lenth, left + _BREADTH_BAR_WIDTH, 413),
+            _BREADTH_BAR_COLORS[band],
         )
         div_draw.text(
-            (66 + offset, 413 - lenth - 25),
+            (left + _BREADTH_BAR_WIDTH // 2, 413 - lenth - 25),
             f"{ij_num}",
             (255, 255, 255),
             ss_font(24),
@@ -392,18 +368,33 @@ async def draw_info_img(is_save: bool = False):
     web_em_img = invert_colors(web_em_img)
     img.paste(web_em_img, (882, 32), web_em_img)
 
-    all_f6, f6diff, last_trade_date = await get_hours_from_em()
-    all_f6_str = number_to_chinese(all_f6)
-
-    if f6diff > 0:
-        f6diff_str = f"放量: {number_to_chinese(abs(f6diff))}"
+    turnover = await market.market_turnover()
+    turnover_provider: str | None = None
+    trade_date = None
+    if is_market_error(turnover):
+        logger.warning(f"[SayuStock] 大盘概览成交额跳过: {turnover.message}")
+        all_f6_str = "暂缺"
+        f6diff_str = ""
         fcolor = (186, 26, 27, 100)
-    elif f6diff < 0:
-        f6diff_str = f"缩量: {number_to_chinese(abs(f6diff))}"
-        fcolor = (18, 199, 30, 100)
     else:
-        f6diff_str = "量差: 暂缺"
-        fcolor = (160, 160, 160, 100)
+        if not isinstance(turnover, MarketTurnover):
+            return "两市成交额数据异常"
+        turnover_provider = turnover.provider
+        trade_date = turnover.last_trade_date
+        all_f6 = turnover.amount
+        all_f6_str = number_to_chinese(all_f6)
+        # 单市场源拿不到昨成交额，此时不谎报放量/缩量
+        prev_amount = turnover.prev_amount
+        f6diff = all_f6 - prev_amount if prev_amount is not None else 0
+        if prev_amount is None:
+            f6diff_str = ""
+            fcolor = (186, 26, 27, 100)
+        elif f6diff > 0:
+            f6diff_str = f"放量: {number_to_chinese(abs(f6diff))}"
+            fcolor = (186, 26, 27, 100)
+        else:
+            f6diff_str = f"缩量: {number_to_chinese(abs(f6diff))}"
+            fcolor = (18, 199, 30, 100)
 
     time_color = (186, 26, 27, 100) if sz_diff >= 0 else (18, 199, 30, 100)
 
@@ -412,10 +403,13 @@ async def draw_info_img(is_save: bool = False):
     time = now.strftime("%H:%M")
     date = now.strftime("%Y.%m.%d")
 
-    if last_trade_date is not None:
-        today_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        days_ago = (today_date - last_trade_date).days
-        days_label = {1: "上日", 2: "前日", 3: "三日前"}.get(days_ago, f"{days_ago}日前")
+    # 休市看「数据是不是今天的」，不是看字段有没有值：东财正常交易日回 None，
+    # 新浪回数据所属交易日（盘中就是今天）。只判 None 会让新浪供数时盘中显示休市。
+    # 按 .date() 相减：带时分相减会把同一天的差算成 -1 天，天数标签也会偏一天。
+    stale_days = 0 if trade_date is None else (now.date() - trade_date.date()).days
+
+    if stale_days > 0:
+        days_label = {1: "上日", 2: "前日", 3: "三日前"}.get(stale_days, f"{stale_days}日前")
         img_draw.rectangle((1395, 62, 1655, 229), (60, 60, 60, 180))
         img_draw.text((1524, 95), f"{weekday}", (160, 160, 160), ss_font(36), "mm")
         img_draw.text((1524, 145), "休  市", (255, 200, 0), ss_font(58), "mm")
@@ -454,63 +448,81 @@ async def draw_info_img(is_save: bool = False):
     await draw_bar(data_gn_z[:20], img, 860, 980, h0)
     await draw_bar(data_gn_f[:20], img, 1265, 980, h0)
 
-    footer = get_footer()
-    img.paste(footer, (425, h - 50), footer)
+    img.paste(footer, (chrome.footer_x, chrome.footer_y), footer)
+
+    # 指数、板块、涨跌、成交额可能来自不同源，脚注按段标明。
+    # 来源行在 footer 图上方，避免和「Power By GsCore」叠在一起。
+    source_bits = [f"指数{source_label(*index_providers)}"]
+    source_bits.append(f"板块{source_label(hy_z_r.provider, hy_f_r.provider, gn_z_r.provider, gn_f_r.provider)}")
+    if breadth_provider:
+        source_bits.append(f"涨跌{source_label(breadth_provider)}")
+    if turnover_provider:
+        source_bits.append(f"成交额{source_label(turnover_provider)}")
+    img_draw.text(
+        (24, chrome.source_y),
+        f"数据来源：{' '.join(source_bits)} | SayuStock",
+        (150, 150, 150),
+        ss_font(24),
+        "lm",
+    )
 
     res = await convert_img(img)
     return res
 
 
-async def draw_bar(sd: List[dict], img: Image.Image, start: int, y: int, h: int = 90):
+async def draw_bar(sd: List[DisplayItem], img: Image.Image, start: int, y: int, h: int = 90) -> None:
     ls = len(sd)
     for hindex, hy in enumerate(sd):
-        hy_diff = hy["f3"]
+        hy_diff = hy.change_pct
         hy_img = Image.new("RGBA", (425, h))
         base_o = int(255 * (((ls + 1) - hindex) / ls))
         if hy_diff >= 0:
             hyc2 = (140, 18, 22, base_o)
             dd = (201, 26, 32, 200)
+            lead = hy.lead_name or ""
+            lead_pct = hy.lead_change_pct
         else:
             hyc2 = (59, 140, 18, base_o)
             dd = (25, 199, 16, 200)
+            lead = hy.fall_name or hy.lead_name or ""
+            lead_pct = hy.fall_change_pct if hy.fall_change_pct is not None else hy.lead_change_pct
 
         hy_draw = ImageDraw.Draw(hy_img)
         hy_draw.rounded_rectangle((23, 2, 403, 57), 0, hyc2)
-        hy_draw.text(
-            (53, 30),
-            f"{hy['f14']}",
-            (255, 255, 255),
-            ss_font(30),
-            "lm",
-        )
+        hy_draw.text((53, 30), hy.name, (255, 255, 255), ss_font(30), "lm")
+        hy_draw.text((53, 75), f"{lead}", dd, ss_font(24), "lm")
+        lp = f"{lead_pct:+.2f}%" if lead_pct is not None else ""
+        hy_draw.text((384, 75), lp, dd, ss_font(24), "rm")
+        hy_draw.text((384, 30), f"{hy_diff:+.2f}%", (255, 255, 255), ss_font(30), "rm")
+        img.paste(hy_img, (start, y + h * hindex), hy_img)
 
-        hy_draw.text(
-            (53, 75),
-            f"{hy['f128'] if hy_diff >= 0 else hy['f207']}",
-            dd,
-            # (140, 18, 22) if hy_diff >= 0 else (59, 140, 18),
-            ss_font(24),
-            "lm",
-        )
-        hy_draw.text(
-            (384, 75),
-            f"{'+' if hy_diff >= 0 else ''}{hy['f136'] if hy_diff >= 0 else hy['f222']}%",
-            dd,
-            # (140, 18, 22) if hy_diff >= 0 else (59, 140, 18),
-            ss_font(24),
-            "rm",
-        )
 
-        hy_draw.text(
-            (384, 30),
-            f"{'+' if hy_diff >= 0 else ''}{hy_diff}%",
-            (255, 255, 255),
-            ss_font(30),
-            "rm",
-        )
-
-        img.paste(
-            hy_img,
-            (start, y + h * hindex),
-            hy_img,
-        )
+def _ai_return_market_overview(
+    data_zs: list[DisplayItem],
+    data_hy_z: list[DisplayItem],
+    data_hy_f: list[DisplayItem],
+    up_value: object,
+    down_value: object,
+    diff_bar: dict[str, int],
+) -> None:
+    """从大盘概览语义数据中提取文本，经 ai_return 给 AI。"""
+    try:
+        result = "【A股大盘概览】\n【主要指数】\n"
+        for item in data_zs[:12]:
+            result += f"  {item.name}: {item.price} ({'+' if item.change_pct >= 0 else ''}{item.change_pct}%)\n"
+        result += f"\n【涨跌分布】上涨 {up_value} 家  下跌 {down_value} 家\n"
+        for label, count in diff_bar.items():
+            if count > 0:
+                result += f"  {label}: {count}\n"
+        result += "\n【领涨行业板块】\n"
+        for hy in data_hy_z[:5]:
+            result += (
+                f"  {hy.name}: {'+' if hy.change_pct >= 0 else ''}{hy.change_pct}% (领涨: {hy.lead_name or 'N/A'})\n"
+            )
+        result += "\n【领跌行业板块】\n"
+        for hy in data_hy_f[:5]:
+            leader = hy.fall_name or hy.lead_name or "N/A"
+            result += f"  {hy.name}: {'+' if hy.change_pct >= 0 else ''}{hy.change_pct}% (领跌: {leader})\n"
+        ai_return(result)
+    except (TypeError, ValueError, KeyError) as e:
+        logger.warning(f"[SayuStock] ai_return 大盘概览数据提取失败: {e}")

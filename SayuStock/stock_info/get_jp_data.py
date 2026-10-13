@@ -1,12 +1,13 @@
 import asyncio
+from typing import Any
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import Tag, BeautifulSoup
 
 from gsuid_core.logger import logger
 
 
-async def get_live_pch_by_symbol(soup, symbol):
+async def get_live_pch_by_symbol(soup: BeautifulSoup | Tag, symbol: str) -> tuple[float, float] | None:
     table = soup.select_one("table.table.table-hover.sortable-theme-minimal")
 
     if not table:
@@ -37,22 +38,19 @@ async def get_live_pch_by_symbol(soup, symbol):
     return float(pch_td.get_text(strip=True)[:-1]), float(p_td.get_text(strip=True))
 
 
-def calculate_change_rate(a: float, b: float):
+def calculate_change_rate(a: float, b: float) -> float:
     previous_value = b - a
     if previous_value == 0:
-        return 0
+        return 0.0
 
     diff = a / previous_value
     return diff * 100
 
 
-async def get_jpy():
+async def get_jpy() -> dict[str, dict[str, Any]] | None:
     url = "https://zh.tradingeconomics.com/japan/government-bond-yield"
-    symbols = {
-        "日本30年期国债收益率": "GJGB30Y:IND",
-        "日本10年期国债收益率": "GJGB10:IND",
-        "日本2年期国债收益率": "GJGB2Y:IND",
-    }
+    symbol_to_find1 = "GJGB30Y:IND"
+    symbol_to_find2 = "GJGB10:IND"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit"
@@ -66,26 +64,31 @@ async def get_jpy():
 
     soup = BeautifulSoup(html_content, "html.parser")
 
-    result = {}
-    for name, symbol in symbols.items():
-        data = await get_live_pch_by_symbol(soup, symbol)
-        if data is None:
-            continue
+    y30 = await get_live_pch_by_symbol(soup, symbol_to_find1)
+    y10 = await get_live_pch_by_symbol(soup, symbol_to_find2)
 
-        diff = calculate_change_rate(data[0], data[1])
-        logger.debug(f"{symbol}: {data[0]} ({diff:.2%})")
-        result[name] = {
-            "f58": name,
-            "f14": name,
-            "f43": data[1],
-            "f170": diff,
-            "f48": "",
-        }
-
-    if not result:
+    if y30 is None or y10 is None:
         return None
 
-    return result
+    diff30 = calculate_change_rate(y30[0], y30[1])
+    diff10 = calculate_change_rate(y10[0], y10[1])
+
+    logger.debug(f"y30: {y30[0]} ({diff30:.2%})")
+    logger.debug(f"y10: {y10[0]} ({diff10:.2%})")
+
+    # 语义字段：name / price / change_pct（供 DisplayItem 使用）
+    return {
+        "JP 30Y": {
+            "name": "JP 30Y",
+            "price": y30[1],
+            "change_pct": diff30,
+        },
+        "JP 10Y": {
+            "name": "JP 10Y",
+            "price": y10[1],
+            "change_pct": diff10,
+        },
+    }
 
 
 if __name__ == "__main__":

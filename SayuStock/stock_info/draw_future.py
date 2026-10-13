@@ -1,195 +1,240 @@
 import random
 import asyncio
-from typing import Any, Dict, List, Tuple, Union, Optional
-from pathlib import Path
-from datetime import datetime
+from dataclasses import replace
 
-from PIL import Image, ImageDraw, ImageFilter
+from gsuid_core.logger import logger
+from gsuid_core.utils.html_render import render_html_to_bytes
+from gsuid_core.ai_core.trigger_bridge import ai_return
 
-from gsuid_core.utils.fonts.fonts import core_font as ss_font
-from gsuid_core.utils.image.convert import convert_img
+from ..utils.market import (
+    DisplayItem,
+    from_quote,
+    get_market,
+    is_market_error,
+    pick_display_items,
+    board_rows_to_items,
+)
+from ..utils.constant import bond, whsc, crypto, i_code, commodity
+from ..utils.sparkline import sparkline_from_series
+from ..utils.all_weather_html import (
+    SPARK_H,
+    SPARK_W,
+    CSS_WIDTH,
+    em_secid,
+    build_all_weather_html,
+    all_weather_canvas_size,
+)
 
-from .get_jp_data import get_jpy
-from ..utils.image import get_footer
-from ..utils.get_OKX import CRYPTO_MAP, get_all_crypto_price
-from ..utils.constant import bond, whsc, i_code, commodity
-from ..utils.stock.request import get_gg, get_mtdata
+ItemMap = dict[str, DisplayItem]
+SparkMap = dict[str, str]
 
-DataLike = Optional[Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]]
-FUTURE_IMG_CACHE_SECONDS = 20
-FUTURE_IMG_CACHE: Optional[Tuple[datetime, Any]] = None
-FUTURE_IMG_LOCK: Optional[asyncio.Lock] = None
 
-CARD_W, CARD_H = 196, 104
-GAP_X, GAP_Y = 12, 12
-SECTION_W = 852
-SECTION_X = 24
-CARD_START_X = 40
-UP_COLOR = (239, 68, 68)
-DOWN_COLOR = (34, 197, 94)
-MID_COLOR = (148, 163, 184)
+async def _quote_item(stock: str, display_name: str) -> DisplayItem | None:
+    q = await get_market().quote(stock)
+    if is_market_error(q):
+        return None
+    item = from_quote(q)
+    if display_name and display_name != item.name:
+        item = replace(item, name=display_name)
+    return item
 
-def _safe_float(v, d=0.0):
-    try: return float(v) if v not in (None, "", "-", "--") else d
-    except: return d
 
-def _format_price(v):
-    n = _safe_float(v)
-    if n == 0: return "-"
-    if abs(n) >= 1000: return f"{n:.1f}"
-    if abs(n) >= 100: return f"{n:.2f}"
-    return f"{n:.3f}".rstrip("0").rstrip(".")
+async def __get_item(
+    result: ItemMap,
+    stock: str,
+    display_name: str,
+    sparks: SparkMap | None,
+) -> None:
+    await asyncio.sleep(random.uniform(0.2, 1))
+    if sparks is None:
+        item = await _quote_item(stock, display_name)
+        if item is not None:
+            result[item.name] = item
+        return
+    series = await get_market().intraday(stock)
+    if is_market_error(series) or series.quote is None:
+        # 外盘多数源只有盘口。分时失败仍留报价格，只是没有折线。
+        item = await _quote_item(stock, display_name)
+        if item is not None:
+            result[item.name] = item
+        return
+    q = series.quote
+    item = from_quote(q)
+    # 链上盖的是序列的 sourceBy，嵌套 quote 可能还是空的。
+    if item.provider is None and series.provider:
+        item = replace(item, provider=series.provider)
+    # 全天候格子按配置表的键展示/对齐；API 名可能是「黄金/美元」对不上 XAU
+    if display_name and display_name != item.name:
+        item = replace(item, name=display_name)
+    result[item.name] = item
+    svg = sparkline_from_series(series, width=SPARK_W, height=SPARK_H)
+    if svg:
+        sparks[item.name] = svg
+        sparks[stock] = svg
 
-def _format_amt(v):
-    n = _safe_float(v)
-    if n <= 0: return "0"
-    for b, s in [(1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")]:
-        if n >= b: return f"{n/b:.2f}{s}".rstrip("0").rstrip(".")
-    return f"{n:.0f}"
 
-def _draw_card(item: Dict) -> Image.Image:
-    name = item.get("f58") or item.get("f14") or "-"
-    price = item.get("f2") or item.get("f43") or "-"
-    diff = _safe_float(item.get("f3") or item.get("f170") or 0)
-    amt = item.get("f6") or item.get("f48") or 0
-    code = str(item.get("f12", "") or "")
-
-    color = UP_COLOR if diff > 0 else (DOWN_COLOR if diff < 0 else MID_COLOR)
-    card = Image.new("RGBA", (CARD_W, CARD_H), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(card)
-    
-    alpha = int(28 + 42 * min(abs(diff)/5.0, 1.0)) if diff != 0 else 28
-    draw.rounded_rectangle([0, 0, CARD_W, CARD_H], radius=16, fill=(*color, alpha))
-    draw.rounded_rectangle([2, 2, CARD_W-2, CARD_H-2], radius=14, fill=(9, 14, 25, 250), outline=(*color, 60), width=1)
-    
-    draw.text((14, 32), _format_price(price), fill=color, font=ss_font(24), anchor="lm")
-    diff_str = f"{'+' if diff > 0 else ''}{diff:.2f}%"
-    draw.rounded_rectangle([CARD_W-85, 20, CARD_W-12, 46], radius=12, fill=(*color, 30), outline=(*color, 80))
-    draw.text((CARD_W-18, 33), diff_str, fill=color, font=ss_font(16), anchor="rm")
-    
-    draw.text((14, 66), str(name).split(" (")[0][:10], fill=(230, 235, 245), font=ss_font(18), anchor="lm")
-    amt_str = _format_amt(amt)
-    draw.text((14, 90), f"AMT {amt_str}" if amt_str != "0" else "LIVE", fill=(100, 120, 140), font=ss_font(12), anchor="lm")
-    if code: draw.text((CARD_W-14, 90), code, fill=(70, 85, 100), font=ss_font(11), anchor="rm")
-    return card
-
-async def _get_list_data(symbols_dict: Dict):
-    codes = ",".join(f"i:{c}" for c in symbols_dict.values() if c)
-    if not codes: return {}
-    resp = await get_mtdata(codes, pz=50)
-    if not isinstance(resp, dict) or "data" not in resp: return {}
-    diff_list = resp["data"].get("diff", [])
-    
-    mapping = {str(c).split(".")[-1].upper(): n for n, c in symbols_dict.items()}
-    result = {}
-    for item in diff_list:
-        code_suffix = str(item.get("f12", "")).upper()
-        name = mapping.get(code_suffix) or item.get("f14")
-        if name:
-            item["f58"] = name
-            result[name] = item
+async def _get_items(_d: dict[str, str], sparks: SparkMap | None = None) -> ItemMap:
+    result: ItemMap = {}
+    tasks = [__get_item(result, code, name, sparks) for name, code in _d.items() if code]
+    await asyncio.gather(*tasks)
     return result
 
-async def append_jpy(result: Dict):
-    data = await get_jpy()
-    if data: result.update(data)
-    return result
 
-async def _get_bond_data():
-    res = await _get_list_data(bond)
-    await append_jpy(res)
-    return res
+async def _fetch_sparks(
+    table: dict[str, str],
+    sparks: SparkMap,
+    sources: list[str | None],
+) -> None:
+    """只补 trends2 折线，不改格子报价（国际市场报价仍走 clist）。"""
 
-async def draw_future_img():
-    global FUTURE_IMG_CACHE, FUTURE_IMG_LOCK
-    if FUTURE_IMG_LOCK is None: FUTURE_IMG_LOCK = asyncio.Lock()
-    async with FUTURE_IMG_LOCK:
-        now = datetime.now()
-        if FUTURE_IMG_CACHE and (now - FUTURE_IMG_CACHE[0]).total_seconds() < 20:
-            return FUTURE_IMG_CACHE[1]
-        
-        d1_raw = await get_mtdata("国际市场")
-        d1 = d1_raw.get("data", {}).get("diff", []) if isinstance(d1_raw, dict) else []
-        
-        tasks = [
-            _get_list_data(commodity),
-            _get_bond_data(),
-            _get_list_data(whsc),
-            get_all_crypto_price()
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        def safe_dict(r): return r if isinstance(r, dict) else {}
-        d2, d3, d4, d5 = [safe_dict(r) for r in results]
-        
-        w, h = 900, 2600
-        img = Image.new("RGBA", (w, h), (2, 6, 23, 255))
-        draw = ImageDraw.Draw(img)
-        
-        # 背景
-        grad = Image.new("RGB", (1, h))
-        for y in range(h):
-            r = y/h
-            grad.putpixel((0,y), (int(2*(1-r)+3*r), int(6*(1-r)+7*r), int(23*(1-r)+18*r)))
-        img.paste(grad.resize((w, h)), (0, 0))
-        
-        # Header
-        draw.rounded_rectangle([24, 22, 876, 120], 22, fill=(8, 13, 25, 240), outline=(150, 160, 180, 30))
-        draw.text((44, 78), "All Weather Monitor", fill=(250, 255, 255), font=ss_font(34), anchor="lm")
-        draw.text((w-50, 60), f"LIVE {now.strftime('%H:%M:%S')}", fill=(34, 211, 238), font=ss_font(16), anchor="rm")
+    async def one(name: str, code: str) -> None:
+        await asyncio.sleep(random.uniform(0.2, 1))
+        secid = em_secid(code)
+        if not secid:
+            return
+        series = await get_market().intraday(secid)
+        if is_market_error(series):
+            return
+        sources.append(series.provider)
+        svg = sparkline_from_series(series, width=SPARK_W, height=SPARK_H)
+        if not svg:
+            return
+        sparks[name] = svg
+        sparks[code] = svg
+        sparks[secid] = svg
+        q = series.quote
+        if q is not None:
+            sparks[q.symbol.code] = svg
+            sparks[q.symbol.provider_symbol] = svg
 
-        sections = [
-            ("GLOBAL INDICES", d1, [list(i_code.keys())], (240, 70, 70)),
-            ("COMMODITIES", d2, [["伦敦金","伦敦银","伦敦铜"],["COMEX黄金","COMEX白银","COMEX铜"],["WTI原油","布伦特原油","天然气"],["螺纹钢主连","豆粕主连","焦煤主连","生猪主连"]], (170, 90, 250)),
-            ("BONDS & YIELDS", d3, [["中国30年期国债","中国10年期国债","中国2年期国债"],["美国30年期国债收益率","美国10年期国债收益率","美国2年期国债收益率"],["日本30年期国债收益率","日本10年期国债收益率","日本2年期国债收益率"],["德国10年期国债收益率","英国10年期国债收益率"]], (235, 180, 10)),
-            ("FOREX", d4, [list(whsc.keys())], (20, 190, 170)),
-            ("CRYPTO", d5, [list(CRYPTO_MAP.keys())], (250, 120, 25)),
-        ]
+    await asyncio.gather(
+        *[one(name, code) for name, code in table.items() if code],
+        return_exceptions=True,
+    )
 
-        curr_y = 150
-        for title, source, groups, color in sections:
-            valid_groups = []
-            sec_up, sec_down, sec_total = 0, 0, 0
-            
-            items_list = source if isinstance(source, list) else source.values()
-            for g in groups:
-                g_items = []
-                for name_to_find in g:
-                    found = None
-                    if isinstance(source, dict) and name_to_find in source:
-                        found = source[name_to_find]
-                    else:
-                        for item in items_list:
-                            if (item.get("f58") or item.get("f14") or "").split(" (")[0] == name_to_find:
-                                found = item
-                                break
-                    if found:
-                        g_items.append(found)
-                        sec_total += 1
-                        df = _safe_float(found.get("f3") or found.get("f170"))
-                        if df > 0: sec_up += 1
-                        elif df < 0: sec_down += 1
-                if g_items: valid_groups.append(g_items)
-            
-            if not valid_groups: continue
-            
-            rows = sum((len(g)+3)//4 for g in valid_groups)
-            sec_h = 70 + rows * (CARD_H + GAP_Y)
-            draw.rounded_rectangle([24, curr_y, 876, curr_y + sec_h], 20, fill=(8, 13, 25, 230), outline=(150, 160, 180, 25))
-            draw.rectangle([24, curr_y, 31, curr_y + sec_h], fill=(*color, 200))
-            draw.text((48, curr_y + 30), title, fill=(245, 250, 255), font=ss_font(24), anchor="lm")
-            draw.text((48, curr_y + 52), f"{sec_total} ASSETS | {sec_up} UP | {sec_down} DOWN", fill=(100, 120, 140), font=ss_font(12), anchor="lm")
-            
-            card_y = curr_y + 65
-            for g in valid_groups:
-                for i, item in enumerate(g):
-                    c_img = _draw_card(item)
-                    img.paste(c_img, (CARD_START_X + (i%4)*(CARD_W+GAP_X), card_y + (i//4)*(CARD_H+GAP_Y)), c_img)
-                card_y += ((len(g)+3)//4) * (CARD_H + GAP_Y)
-            
-            curr_y += sec_h + 20
 
-        footer = get_footer()
-        img.paste(footer, (450 - footer.width//2, curr_y + 10), footer)
-        res = await convert_img(img.crop((0, 0, 900, min(curr_y + 100, 2600))))
-        FUTURE_IMG_CACHE = (datetime.now(), res)
-        return res
+def _index_queries() -> dict[str, str]:
+    """国际市场板块失败时，按单只 secid 报价。clist 键要去掉 ``i:``。"""
+    out: dict[str, str] = {}
+    for name, code in i_code.items():
+        secid = em_secid(code)
+        if secid:
+            out[name] = secid
+    return out
+
+
+async def draw_future_img() -> str | bytes:
+    market = get_market()
+    intl = await market.board("国际市场", limit=100, sort_asc=False)
+    sparks: SparkMap = {}
+    # 板块快照与折线可能不是同一个源，图角两边都要收。
+    extra_sources: list[str | None] = []
+    board_message = intl.message if is_market_error(intl) else ""
+
+    async def _tail() -> ItemMap | None:
+        # 国际市场列表只有东财。列表失败改走单只报价，其余分区照常画。
+        if is_market_error(intl):
+            return await _get_items(_index_queries(), sparks)
+        extra_sources.append(intl.provider)
+        await _fetch_sparks(i_code, sparks, extra_sources)
+        # 东财「国际市场」clist 只回固定的一小撮指数。本地补充的标的
+        # （俄罗斯RTS / 巴西BOVESPA / 澳洲标普200 / 印度SENSEX / 欧洲斯托克50）
+        # 不在这个列表里，必须在板块成功时也按 secid 单独补报价；否则它们会在
+        # pick_display_items 阶段被静默丢掉——板块失败反而能显示（走 _index_queries），
+        # 板块成功却看不到，是最难查的那种「时有时无」。
+        listed = {row.name for row in intl.rows}
+        # i_code 的值带 ``i:`` 前缀（clist 用），单只报价要的是裸 secid，
+        # 必须过一遍 em_secid；直接传 ``i:100.RTS`` 会被东财当成不存在的股票。
+        extra_keys = {
+            n: em_secid(c) for n, c in i_code.items() if n not in listed and em_secid(c)
+        }
+        if not extra_keys:
+            return None
+        return await _get_items(extra_keys, sparks)
+
+    results = await asyncio.gather(
+        _get_items(commodity, sparks),
+        _get_items(bond, sparks),
+        _get_items(whsc, sparks),
+        _get_items(crypto, sparks),
+        _tail(),
+        return_exceptions=True,
+    )
+
+    def safe_map(result: object) -> ItemMap:
+        if isinstance(result, BaseException) or not isinstance(result, dict):
+            return {}
+        out: ItemMap = {}
+        for key, value in result.items():
+            if isinstance(key, str) and isinstance(value, DisplayItem):
+                out[key] = value
+        return out
+
+    if is_market_error(intl):
+        data_gz = list(safe_map(results[4]).values())
+    else:
+        data_gz = board_rows_to_items(intl.rows)
+        # 合并上面按 secid 补出来的本地指数（板块列表里没有的那些）。
+        data_gz.extend(safe_map(results[4]).values())
+    data2 = safe_map(results[0])
+    data3 = safe_map(results[1])
+    data4 = safe_map(results[2])
+    data5 = safe_map(results[3])
+
+    sections: list[tuple[str, list[DisplayItem]]] = [
+        ("国际市场", pick_display_items(data_gz, i_code)),
+        ("大宗商品", pick_display_items(data2, commodity)),
+        ("债券市场", pick_display_items(data3, bond)),
+        ("外汇市场", pick_display_items(data4, whsc)),
+        ("加密货币", pick_display_items(data5, crypto)),
+    ]
+    visible = [(title, items) for title, items in sections if items]
+    if not visible:
+        return board_message or "全天候没有可展示的行情"
+    _ai_return_all_weather(data_gz, data2, data3, data4, data5)
+    html = build_all_weather_html(visible, sparklines=sparks, sources=tuple(extra_sources))
+    _, height = all_weather_canvas_size(sections, sparks)
+    try:
+        return await render_html_to_bytes(
+            html,
+            max_width=float(CSS_WIDTH * 2),
+            dpi=192.0,
+            device_height=float(height * 2),
+            default_font_size=15.0,
+            allow_refit=False,
+            image_format="png",
+            lang="zh",
+            root_max_width=float(CSS_WIDTH),
+        )
+    except (RuntimeError, OSError, ValueError) as e:
+        logger.exception(f"[SayuStock] 全天候 HTML 出图失败: {e}")
+        return "全天候出图失败"
+
+
+def _ai_return_all_weather(
+    data_gz: list[DisplayItem],
+    data_commodity: ItemMap,
+    data_bond: ItemMap,
+    data_whsc: ItemMap,
+    data_crypto: ItemMap,
+) -> None:
+    """全天候语义数据 → ai_return。"""
+    try:
+        result = "【全天候板块】\n\n【全球股市】\n"
+        for name in i_code:
+            for item in data_gz:
+                if name in item.name or item.name in name:
+                    result += f"  {item.name}: {item.price} ({item.change_pct}%)\n"
+                    break
+        for title, pool, keys in (
+            ("大宗商品", data_commodity, commodity),
+            ("债券", data_bond, bond),
+            ("外汇", data_whsc, whsc),
+            ("加密货币", data_crypto, crypto),
+        ):
+            result += f"\n【{title}】\n"
+            for item in pick_display_items(pool, keys):
+                result += f"  {item.name}: {item.price} ({item.change_pct}%)\n"
+        ai_return(result)
+    except (TypeError, ValueError, KeyError) as e:
+        logger.warning(f"[SayuStock] ai_return 全天候失败: {e}")

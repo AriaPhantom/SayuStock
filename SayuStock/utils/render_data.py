@@ -1,0 +1,1239 @@
+"""渲染前的数据计算层 —— 全插件唯一真相源。
+
+只接受领域模型（``IntradaySeries`` / ``KlineSeries`` / ``BoardSnapshot``），
+转成图表渲染所需的稳定结构，不引入 plotly / matplotlib / mplchart。
+plotly 版（``stock_cloudmap/render.py``）与 mpl 版（``stock_stockinfo``）共用。
+指标数学见 ``utils/indicators.py``。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Any, List, Sequence, cast
+from datetime import date, datetime, timedelta
+from collections import defaultdict
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+
+try:
+    from gsuid_core.logger import logger
+except ImportError:  # 最小依赖 CI（仅 pandas/numpy/pytest）没有 gsuid_core，
+    import logging  # 与 market/errors.py、provider_registry.py 同款降级
+
+    logger = logging.getLogger("SayuStock")
+
+from .utils import int_to_percentage, number_to_chinese
+from .constant import ErroText
+from .time_range import (
+    get_session_anchor_date,
+    get_trading_datetimes_bjt,
+    is_within_trading_day_window,
+)
+from .market.enums import IpoStage, IpoMarket
+from .market.models import IpoEvent, KlineSeries, BoardSnapshot, IntradaySeries
+from .market.convert.dataframe import kline_to_cn_df
+
+DataResult = str
+
+
+@dataclass(slots=True)
+class KlineRenderData:
+    df: pd.DataFrame
+    chart_df: pd.DataFrame
+    title: str
+    freq_label: str
+    tickformat: str
+    median_delta: pd.Timedelta
+    x_min: pd.Timestamp
+    x_max: pd.Timestamp
+    breaks: list[dict[str, list[pd.Timestamp]]]
+    max_turnovers: pd.DataFrame
+
+
+@dataclass(slots=True)
+class SingleStockRenderData:
+    df: pd.DataFrame
+    stock_name: str
+    stock_code: str
+    new_price: Any
+    gained: float
+    custom_info: str
+    turnover_rate: Any
+    total_amount: Any
+    open_price: float
+    y_axis_max_price: float
+    y_axis_min_price: float
+    max_fluctuation: float
+    tick_values: list[float]
+    tick_texts: list[str]
+    bar_colors: list[str]
+    title_text: str
+    ndays: int
+    day_starts: list[int]
+    day_tick_positions: list[int]
+    day_tick_labels: list[str]
+    today_change: float
+    ndays_change: float
+
+
+@dataclass(slots=True)
+class MultiStockItem:
+    name: str
+    df: pd.DataFrame
+    total_volume: float
+    line_color: str = ""
+
+
+@dataclass(slots=True)
+class MultiStockRenderData:
+    stocks: list[MultiStockItem]
+    y_axis_max: float
+    y_axis_min: float
+    tick_values: list[int]
+    tick_texts: list[str]
+    subtitle_parts: list[str]
+
+
+@dataclass(slots=True)
+class CompareStockItem:
+    name: str
+    df: pd.DataFrame
+    color: str = ""
+
+
+@dataclass(slots=True)
+class CompareRenderData:
+    items: list[CompareStockItem]
+
+
+@dataclass(slots=True)
+class CloudmapRenderData:
+    df: pd.DataFrame
+    title: str
+    treemap_path: list[str]
+
+
+def _sort_df(df: pd.DataFrame, by: str, *, ascending: bool = True) -> pd.DataFrame:
+    return df.sort_values(by=by, ascending=ascending, inplace=False)
+
+
+def _sort_series(series: pd.Series, *, ascending: bool = True) -> pd.Series:
+    return series.sort_values(ascending=ascending, inplace=False)
+
+
+def _reset_df(df: pd.DataFrame, *, drop: bool = True) -> pd.DataFrame:
+    return df.reset_index(drop=drop)
+
+
+def _bool_mask_series(series: pd.Series, mask: pd.Series) -> pd.Series:
+    """布尔掩码切片。pandas 3 把结果标成 Series 或 ndarray。"""
+    sliced = series[mask]
+    assert isinstance(sliced, pd.Series), "布尔掩码应切出 Series"
+    return sliced
+
+
+def _frame_column(df: pd.DataFrame, key: str) -> pd.Series:
+    column = df[key]
+    assert isinstance(column, pd.Series), f"列 {key} 存在重复标签"
+    return column
+
+
+def _numeric_series(data: object, *, fill_value: float | None = None) -> pd.Series:
+    if isinstance(data, pd.Series):
+        source = data
+    elif isinstance(data, (list, tuple, pd.Index)):
+        source = pd.Series(list(data))
+    else:
+        source = pd.Series([data])
+    series = pd.to_numeric(source, errors="coerce")
+    assert isinstance(series, pd.Series), "to_numeric(Series) 恒返回 Series"
+    if fill_value is None:
+        return series
+    return series.fillna(fill_value)
+
+
+def _as_optional_float(value: object) -> float | None:
+    if isinstance(value, (int, float, str)):
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if math.isfinite(result) and result != 0:
+            return result
+    return None
+
+
+def _trend_minute_key(value: object) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if len(stripped) >= 5:
+            return stripped[-5:]
+        return stripped
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return ""
+        return value.strftime("%H:%M")
+    return str(value)
+
+
+def _parse_trend_datetime_value(value: object) -> pd.Timestamp | None:
+    """解析分时点时间：支持 ``HH:MM`` / ``YYYY-MM-DD HH:MM`` / datetime。"""
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return None if pd.isna(value) else value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    # 纯 HH:MM —— 无日期，交由上层补日期
+    if len(text) <= 5 and ":" in text and "-" not in text:
+        return None
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None
+    assert isinstance(parsed, pd.Timestamp)
+    return parsed
+
+
+def _resolve_trend_absolute_datetimes(
+    trends: list[dict[str, Any]],
+    *,
+    now_bjt: Any | None = None,
+) -> list[tuple[dict[str, Any], pd.Timestamp]]:
+    """把 trends 解析为 (原始点, 绝对时间) 列表。
+
+    - 已带完整日期（``YYYY-MM-DD HH:MM``）时直接使用；
+    - 仅 ``HH:MM``（旧缓存）时按顺序检测跨天回绕，并把最后一个点锚定到
+      ``now_bjt`` 所在会话，避免夜盘/美期把上半天数据贴到「次日」。
+    """
+    import datetime as _dt
+
+    if not trends:
+        return []
+
+    if now_bjt is None:
+        now_bjt_dt = _dt.datetime.now()
+    elif isinstance(now_bjt, pd.Timestamp):
+        now_bjt_dt = now_bjt.to_pydatetime().replace(tzinfo=None)
+    elif isinstance(now_bjt, _dt.datetime):
+        now_bjt_dt = now_bjt.replace(tzinfo=None) if now_bjt.tzinfo else now_bjt
+    else:
+        now_bjt_dt = _dt.datetime.now()
+
+    # 路径 1：全部（或绝大多数）点已带完整日期
+    full_parsed: list[tuple[dict[str, Any], pd.Timestamp | None]] = []
+    full_count = 0
+    for item in trends:
+        parsed = _parse_trend_datetime_value(item.get("datetime") if isinstance(item, dict) else None)
+        full_parsed.append((item, parsed))
+        if parsed is not None:
+            full_count += 1
+    if full_count >= max(1, len(trends) // 2):
+        full_resolved: list[tuple[dict[str, Any], pd.Timestamp]] = []
+        for item, parsed in full_parsed:
+            if parsed is not None:
+                full_resolved.append((item, parsed))
+        return full_resolved
+
+    # 路径 2：仅 HH:MM —— 顺序回绕 + 锚定最后一点
+    clock_times: list[_dt.time] = []
+    for item in trends:
+        key = _trend_minute_key(item.get("datetime") if isinstance(item, dict) else item)
+        try:
+            clock_times.append(_dt.datetime.strptime(key, "%H:%M").time())
+        except ValueError:
+            clock_times.append(_dt.time(0, 0))
+
+    day_offsets: list[int] = []
+    day_offset = 0
+    prev_mins = -1
+    for clock in clock_times:
+        mins = clock.hour * 60 + clock.minute
+        # 明显回绕（如 23:59 → 00:00）；允许小幅乱序不抬日
+        if prev_mins >= 0 and mins + 60 < prev_mins:
+            day_offset += 1
+        day_offsets.append(day_offset)
+        prev_mins = mins
+
+    last_clock = clock_times[-1]
+    if last_clock <= now_bjt_dt.time():
+        last_date = now_bjt_dt.date()
+    else:
+        # 例如现在 01:00、最后分时 14:30 → 数据属于昨天收盘
+        last_date = now_bjt_dt.date() - _dt.timedelta(days=1)
+
+    first_date = last_date - _dt.timedelta(days=day_offsets[-1])
+    clock_resolved: list[tuple[dict[str, Any], pd.Timestamp]] = []
+    for item, clock, offset in zip(trends, clock_times, day_offsets, strict=False):
+        abs_dt = _dt.datetime.combine(first_date + _dt.timedelta(days=offset), clock)
+        ts = pd.Timestamp(abs_dt)
+        if pd.isna(ts):
+            continue
+        clock_resolved.append((item, cast(pd.Timestamp, ts)))
+    return clock_resolved
+
+
+def _infer_kline_freq(df: pd.DataFrame) -> tuple[str, str, str, pd.Timedelta]:
+    date_series = _frame_column(df, "日期")
+    sorted_dates = _sort_series(date_series, ascending=True).reset_index(drop=True)
+    deltas = sorted_dates.diff().dropna()
+    if deltas.empty:
+        median_delta = pd.Timedelta(days=1)
+    else:
+        median_seconds = float(deltas.dt.total_seconds().median())
+        median_delta = pd.Timedelta(seconds=median_seconds)
+    # 构造器静态返回 Timedelta | NaTType；deltas 非空时中位秒数恒有限，不会产生 NaT
+    assert isinstance(median_delta, pd.Timedelta)
+
+    logger.info(f"[SayuStock] median delta: {median_delta}")
+    seconds = median_delta.total_seconds()
+    if seconds >= 0.9 * 86400:
+        inferred_freq = "D"
+        freq_label = "1D"
+    elif seconds >= 0.9 * 3600:
+        hours = max(1, int(round(seconds / 3600)))
+        inferred_freq = f"{hours}H"
+        freq_label = inferred_freq
+    else:
+        minutes = max(1, int(round(seconds / 60)))
+        for item in (1, 5, 15, 30, 60):
+            if abs(minutes - item) <= (item * 0.25):
+                minutes = item
+                break
+        inferred_freq = f"{minutes}T"
+        freq_label = f"{minutes}min"
+
+    tickformat: str
+    if "T" in inferred_freq or "H" in inferred_freq:
+        tickformat = "%m-%d %H:%M"
+    elif inferred_freq == "M":
+        tickformat = "%Y.%m"
+    else:
+        tickformat = "%Y.%m.%d"
+
+    logger.info(f"[SayuStock] 判定周期 inferred_freq={inferred_freq}, freq_label={freq_label}")
+    return inferred_freq, freq_label, tickformat, median_delta
+
+
+def _kline_render_from_cn_df(df: pd.DataFrame, title_name: str) -> KlineRenderData | DataResult:
+    df = df.copy()
+    df["日期"] = pd.to_datetime(df["日期"], errors="coerce")
+    df = df.dropna(subset=["日期"])
+    df = _reset_df(_sort_df(df, "日期"), drop=True)
+    if df.empty:
+        return ErroText["notData"]
+
+    _, freq_label, tickformat, median_delta = _infer_kline_freq(df)
+    date_column = _frame_column(df, "日期")
+    x_min: pd.Timestamp = date_column.min()
+    x_max: pd.Timestamp = date_column.max()
+
+    chart_df = pd.DataFrame(
+        {
+            "date": df["日期"],
+            "open": _numeric_series(df["开盘"]),
+            "high": _numeric_series(df["最高"]),
+            "low": _numeric_series(df["最低"]),
+            "close": _numeric_series(df["收盘"]),
+            "volume": _numeric_series(df["成交量"], fill_value=0),
+            "turnover": _numeric_series(df["换手率"], fill_value=0) if "换手率" in df else 0.0,
+            "ma5": _numeric_series(df["5日均线"]) if "5日均线" in df else np.nan,
+            "ma10": _numeric_series(df["10日均线"]) if "10日均线" in df else np.nan,
+        }
+    )
+    chart_df = chart_df.dropna(subset=["open", "high", "low", "close"])
+    if chart_df.empty:
+        return ErroText["notData"]
+    turnover_col = chart_df["turnover"]
+    if isinstance(turnover_col, pd.Series) and not turnover_col.empty:
+        if float(turnover_col.fillna(0).abs().max()) == 0.0:
+            # 备用源日 K 常常没有换手字段，全 0 会画成贴地直线
+            chart_df["turnover"] = np.nan
+
+    turnover = _numeric_series(df["换手率"]) if "换手率" in df else pd.Series(dtype=float)
+    df["is_max"] = turnover == turnover.rolling(window=3, center=True).max()
+    max_turnovers = df[df["is_max"] & (turnover > 0)]
+    assert isinstance(max_turnovers, pd.DataFrame), "布尔掩码索引恒返回 DataFrame"
+
+    dates = _frame_column(df, "日期")
+    diffs = dates.diff()
+    threshold = pd.Timedelta(seconds=median_delta.total_seconds() * 1.5)
+    breaks: list[dict[str, list[pd.Timestamp]]] = []
+    for index in range(1, len(dates)):
+        if pd.notna(diffs.iloc[index]) and diffs.iloc[index] > threshold:
+            breaks.append(dict(bounds=[dates.iloc[index - 1], dates.iloc[index]]))
+    logger.info(f"[SayuStock] 自动检测到 {len(breaks)} 个时间缺口")
+
+    return KlineRenderData(
+        df=df,
+        chart_df=chart_df,
+        title=f"{title_name} {freq_label}",
+        freq_label=freq_label,
+        tickformat=tickformat,
+        median_delta=median_delta,
+        x_min=x_min,
+        x_max=x_max,
+        breaks=breaks,
+        max_turnovers=max_turnovers,
+    )
+
+
+def build_kline_render_data(series: KlineSeries) -> KlineRenderData | DataResult:
+    """从 ``KlineSeries`` 构建渲染数据（供应商无关）。"""
+    if not isinstance(series, KlineSeries):
+        return ErroText["notData"]
+    df = kline_to_cn_df(series)
+    if df.empty:
+        return ErroText["notData"]
+    title = series.symbol.display_name or "K线"
+    return _kline_render_from_cn_df(df, title)
+
+
+# 兼容旧名
+build_kline_render_data_from_series = build_kline_render_data
+
+
+def _empty_trend_row(dt_obj: object) -> dict[str, Any]:
+    return {
+        "datetime": dt_obj,
+        "price": None,
+        "open": None,
+        "high": None,
+        "low": None,
+        "amount": None,
+        "money": None,
+        "avg_price": None,
+    }
+
+
+def _rows_from_resolved_trends(
+    resolved: list[tuple[dict[str, Any], pd.Timestamp]],
+    *,
+    code_id: str,
+    now_bjt: Any,
+    fill_session_future: bool,
+    fill_session_gaps: bool,
+) -> list[dict[str, Any]]:
+    """以 trends 绝对时间为真相源构图。
+
+    会话模板（``get_trading_datetimes_bjt``）**只**用于：
+    - ``fill_session_future``：盘中尚未走到的未来分钟占位；
+    - ``fill_session_gaps``：已有数据区间内的空分钟（单股分时轴更完整）。
+
+    绝不把数据点按 HH:MM 重新贴进模板——那才会把跨天品种甩到「次日」。
+    """
+    if not resolved:
+        return []
+
+    existing_by_ts: dict[pd.Timestamp, dict[str, Any]] = {}
+    for item, ts in resolved:
+        minute_ts = cast(pd.Timestamp, pd.Timestamp(ts).floor("min"))
+        if pd.isna(minute_ts):
+            continue
+        existing_by_ts[minute_ts] = {**item, "datetime": minute_ts}
+
+    data_times = sorted(existing_by_ts.keys())
+    rows: list[dict[str, Any]] = [existing_by_ts[t] for t in data_times]
+
+    if not fill_session_future and not fill_session_gaps:
+        return rows
+
+    session_times = [pd.Timestamp(t).floor("min") for t in get_trading_datetimes_bjt(code_id, now_bjt=now_bjt)]
+    if not session_times:
+        return rows
+
+    data_min, data_max = data_times[0], data_times[-1]
+    have = set(data_times)
+    extra: list[dict[str, Any]] = []
+
+    if fill_session_gaps:
+        # 只在「已有数据覆盖的时间范围内」补洞，不外推到错误的一天
+        for minute_ts in session_times:
+            if minute_ts < data_min or minute_ts > data_max:
+                continue
+            if minute_ts not in have:
+                extra.append(_empty_trend_row(minute_ts.to_pydatetime()))
+
+    # 盘中（含午休）把轴补到当日收盘；收盘后 / 未开盘日不外推空轴
+    if fill_session_future and is_within_trading_day_window(code_id, now_bjt=now_bjt):
+        for minute_ts in session_times:
+            if minute_ts <= data_max:
+                continue
+            if minute_ts not in have:
+                extra.append(_empty_trend_row(minute_ts.to_pydatetime()))
+
+    if not extra:
+        return rows
+    rows.extend(extra)
+    rows.sort(key=lambda row: pd.Timestamp(row["datetime"]) if row.get("datetime") is not None else pd.Timestamp.min)
+    return rows
+
+
+def _as_timestamp(value: object) -> pd.Timestamp | None:
+    if value is None or value is pd.NaT:
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value
+    if isinstance(value, datetime):
+        stamp = pd.Timestamp(value)
+        return stamp if isinstance(stamp, pd.Timestamp) else None
+    if isinstance(value, np.datetime64):
+        stamp = pd.Timestamp(value)
+        return stamp if isinstance(stamp, pd.Timestamp) else None
+    return None
+
+
+def _minute_ts(ts: object) -> pd.Timestamp | None:
+    stamp = ts if isinstance(ts, pd.Timestamp) else _as_timestamp(ts)
+    if stamp is None:
+        return None
+    minute = stamp.floor("min")
+    if not isinstance(minute, pd.Timestamp):
+        return None
+    return minute
+
+
+def _naive_bjt(ts: pd.Timestamp) -> datetime:
+    py = ts.to_pydatetime()
+    if py.tzinfo is not None:
+        return py.replace(tzinfo=None)
+    return py
+
+
+def _rows_from_multi_day_trends(
+    resolved: list[tuple[dict[str, Any], pd.Timestamp]],
+    *,
+    code_id: str,
+) -> list[dict[str, Any]]:
+    """按会话日切开，每天铺满该日交易分钟，五日图各日等宽。"""
+    if not resolved:
+        return []
+    grouped: dict[date, dict[pd.Timestamp, dict[str, Any]]] = {}
+    order: list[date] = []
+    for item, ts in resolved:
+        minute_ts = _minute_ts(ts)
+        if minute_ts is None:
+            continue
+        key = get_session_anchor_date(code_id, now_bjt=_naive_bjt(minute_ts))
+        if key not in grouped:
+            grouped[key] = {}
+            order.append(key)
+        grouped[key][minute_ts] = {**item, "datetime": minute_ts}
+    rows: list[dict[str, Any]] = []
+    for key in order:
+        existing = grouped[key]
+        first_ts = min(existing)
+        session_times: list[pd.Timestamp] = []
+        for t in get_trading_datetimes_bjt(code_id, now_bjt=_naive_bjt(first_ts)):
+            minute_ts = _minute_ts(t)
+            if minute_ts is not None:
+                session_times.append(minute_ts)
+        if not session_times:
+            rows.extend(existing[t] for t in sorted(existing))
+            continue
+        for minute_ts in session_times:
+            if minute_ts in existing:
+                rows.append(existing[minute_ts])
+            else:
+                rows.append(_empty_trend_row(minute_ts.to_pydatetime()))
+    return rows
+
+
+def _intraday_day_axis(
+    dts: pd.Series,
+    prices: pd.Series,
+    *,
+    code_id: str = "",
+    prev_close: float | None = None,
+) -> tuple[list[int], list[int], list[str]]:
+    """五日分时 X 轴：每个交易日一段，刻度为 MM-DD + 当日涨跌。"""
+    starts: list[int] = []
+    tick_pos: list[int] = []
+    tick_lab: list[str] = []
+    if dts.empty:
+        return starts, tick_pos, tick_lab
+    keys: list[date | None] = []
+    for ts in dts:
+        stamp = _as_timestamp(ts)
+        if stamp is None:
+            keys.append(None)
+            continue
+        if code_id:
+            keys.append(get_session_anchor_date(code_id, now_bjt=_naive_bjt(stamp)))
+        else:
+            keys.append(stamp.date())
+    groups: list[tuple[date, int, int]] = []
+    current: date | None = None
+    for index, key in enumerate(keys):
+        if key is None:
+            continue
+        if current is None or key != current:
+            groups.append((key, index, index))
+            current = key
+        else:
+            day, start, _end = groups[-1]
+            groups[-1] = (day, start, index)
+    prev_last: float | None = prev_close if prev_close is not None and prev_close != 0 else None
+    for key, start, end in groups:
+        starts.append(start)
+        window = prices.iloc[start : end + 1]
+        valid = window.dropna()
+        if valid.empty:
+            chg_text = "—"
+        else:
+            last = float(valid.iloc[-1])
+            if prev_last is None:
+                first = float(valid.iloc[0])
+                pct = (last / first - 1.0) * 100.0 if first != 0 else 0.0
+            else:
+                pct = (last / prev_last - 1.0) * 100.0 if prev_last != 0 else 0.0
+            prev_last = last
+            chg_text = f"{pct:+.2f}%"
+        tick_pos.append((start + end) // 2)
+        tick_lab.append(f"{key.month:02d}-{key.day:02d}\n{chg_text}")
+    return starts, tick_pos, tick_lab
+
+
+def _last_session_change_amount(price_history_pd: pd.DataFrame) -> tuple[float | None, float | None]:
+    """最后一节分时的涨跌幅（%）和成交额。报价缺失时给页眉用。"""
+    if price_history_pd.empty:
+        return None, None
+    dts = pd.to_datetime(_frame_column(price_history_pd, "dt"))
+    prices = _frame_column(price_history_pd, "price")
+    money = _frame_column(price_history_pd, "money")
+    days = dts.dt.date
+    # 会话补齐会在末尾垫无价分钟，最后一节必须是有成交价的那天
+    priced_days = days[prices.notna()].dropna()
+    if priced_days.empty:
+        return None, None
+    last_day = priced_days.iloc[-1]
+    today_mask = days == last_day
+    prev_mask = days < last_day
+    today_prices = _bool_mask_series(prices, today_mask).dropna()
+    if today_prices.empty:
+        return None, None
+    last_px = float(today_prices.iloc[-1])
+    prev_prices = _bool_mask_series(prices, prev_mask).dropna()
+    base = float(prev_prices.iloc[-1]) if not prev_prices.empty else float(today_prices.iloc[0])
+    change = ((last_px / base) - 1.0) * 100.0 if base else None
+    today_money = _bool_mask_series(money, today_mask).dropna()
+    amount = float(today_money.sum()) if not today_money.empty else None
+    return change, amount
+
+
+def _first_session_last_price(price_history_pd: pd.DataFrame, code_id: str) -> float | None:
+    """多日分时窗口里第一天最后一个有效价（该日收盘）。"""
+    dts = _frame_column(price_history_pd, "dt")
+    prices = _frame_column(price_history_pd, "price")
+    first_key: date | None = None
+    last: float | None = None
+    for ts, px in zip(dts, prices, strict=True):
+        if pd.isna(px):
+            continue
+        stamp = _as_timestamp(ts)
+        if stamp is None:
+            continue
+        key = get_session_anchor_date(code_id, now_bjt=_naive_bjt(stamp)) if code_id else stamp.date()
+        if first_key is None:
+            first_key = key
+        elif key != first_key:
+            break
+        last = float(px)
+    return last
+
+
+def _intraday_zero_axis(series: IntradaySeries, price_history_pd: pd.DataFrame) -> float | None:
+    """分时 0 轴：1 日用昨收；多日用窗口前收盘（ref_close），否则首日收盘。"""
+    ndays = series.ndays if series.ndays > 1 else 1
+    if ndays > 1:
+        if series.ref_close is not None and series.ref_close != 0:
+            return float(series.ref_close)
+        code_id = series.symbol.provider_symbol or series.symbol.code
+        return _first_session_last_price(price_history_pd, code_id)
+    quote = series.quote
+    if quote is not None and quote.prev_close is not None and quote.prev_close != 0:
+        return float(quote.prev_close)
+    if quote is not None and quote.open is not None and quote.open != 0:
+        return float(quote.open)
+    if series.points:
+        return float(series.points[0].open or series.points[0].price)
+    return None
+
+
+def _session_rows_from_intraday(
+    series: IntradaySeries,
+    *,
+    now_bjt: Any,
+    fill_session_future: bool,
+    fill_session_gaps: bool,
+) -> list[dict[str, Any]]:
+    """IntradaySeries → 带会话补齐的行（供分时图时间轴）。"""
+    if not series.points:
+        return []
+    code_id = series.symbol.provider_symbol or series.symbol.code
+    trends = [
+        {
+            "datetime": p.ts.strftime("%Y-%m-%d %H:%M"),
+            "price": p.price,
+            "money": p.amount,
+            "open": p.open,
+            "high": p.high,
+            "low": p.low,
+            "amount": p.volume,
+            "avg_price": p.avg_price,
+        }
+        for p in series.points
+    ]
+    resolved = _resolve_trend_absolute_datetimes(trends, now_bjt=now_bjt)
+    if series.ndays > 1:
+        return _rows_from_multi_day_trends(resolved, code_id=code_id)
+    return _rows_from_resolved_trends(
+        resolved,
+        code_id=code_id,
+        now_bjt=now_bjt,
+        fill_session_future=fill_session_future,
+        fill_session_gaps=fill_session_gaps,
+    )
+
+
+def build_single_stock_render_data(series: IntradaySeries) -> SingleStockRenderData | DataResult:
+    """从 ``IntradaySeries`` 构建单股分时渲染数据。"""
+    import datetime as _dt
+
+    if not isinstance(series, IntradaySeries) or not series.points:
+        return ErroText["notOpen"]
+
+    now_bjt = _dt.datetime.now()
+    rows = _session_rows_from_intraday(
+        series,
+        now_bjt=now_bjt,
+        fill_session_future=True,
+        fill_session_gaps=True,
+    )
+    # 保留会话补齐后的全部行（含未来空分钟），X 轴才能画到收盘；
+    # 有价点画线，无价点占位。与 multi-stock 一致，禁止再滤掉 future NaN。
+    if rows:
+        full_data = [{"datetime": r["datetime"], "price": r.get("price"), "money": r.get("money")} for r in rows]
+    else:
+        full_data = [{"datetime": p.ts, "price": p.price, "money": p.amount} for p in series.points]
+
+    price_history_pd = pd.DataFrame(
+        {
+            "datetime": [item["datetime"] for item in full_data],
+            "price": [item["price"] for item in full_data],
+            "money": [item["money"] for item in full_data],
+        }
+    )
+    price_history_pd["dt"] = pd.to_datetime(price_history_pd["datetime"], errors="coerce")
+    price_history_pd["price"] = _numeric_series(price_history_pd["price"])
+    price_history_pd["money"] = _numeric_series(price_history_pd["money"], fill_value=0)
+    priced_only = _frame_column(price_history_pd, "price").dropna()
+    if price_history_pd.empty or priced_only.empty:
+        return ErroText["notOpen"]
+
+    ndays = series.ndays if series.ndays > 1 else 1
+    zero_axis = _intraday_zero_axis(series, price_history_pd)
+    if zero_axis is None:
+        return ErroText["notOpen"]
+    open_price = zero_axis
+
+    price_history_pd["percentage_change"] = ((price_history_pd["price"] / open_price) - 1) * 100
+
+    price_column = _frame_column(price_history_pd, "price")
+    max_price = float(priced_only.max())
+    min_price = float(priced_only.min())
+    max_fluctuation = max((max_price - open_price) / open_price, (open_price - min_price) / open_price)
+    if pd.isna(max_fluctuation) or max_fluctuation <= 0:
+        max_fluctuation = 0.01
+    y_axis_max_price = open_price * (1 + max_fluctuation + 0.01)
+    y_axis_min_price = open_price * (1 - max_fluctuation - 0.01)
+
+    tick_values: list[float] = []
+    tick_texts: list[str] = []
+    max_range_percent = max_fluctuation * 100
+    if max_range_percent > 30:
+        step = 5
+    elif max_range_percent > 15:
+        step = 2
+    else:
+        step = 1
+    for item in range(int(-(max_fluctuation + 0.01) * 100), int((max_fluctuation + 0.01) * 100) + 1):
+        if item % step == 0:
+            price = open_price * (1 + item / 100)
+            if y_axis_min_price <= price <= y_axis_max_price:
+                tick_values.append(price)
+                tick_texts.append(f"{item}%")
+
+    prices = price_column
+    bar_colors: list[str] = []
+    last_valid: float | None = None
+    for index in range(len(prices)):
+        curr = prices.iloc[index]
+        if pd.isna(curr):
+            bar_colors.append("grey")
+            continue
+        curr_f = float(curr)
+        if last_valid is None:
+            bar_colors.append("red" if curr_f > open_price else "green")
+        elif curr_f > last_valid:
+            bar_colors.append("red")
+        elif curr_f < last_valid:
+            bar_colors.append("green")
+        else:
+            bar_colors.append("grey")
+        last_valid = curr_f
+
+    quote = series.quote
+    session_change, session_amount = _last_session_change_amount(price_history_pd)
+    if quote is not None and quote.change_pct is not None:
+        today_change = float(quote.change_pct)
+    elif session_change is not None:
+        today_change = session_change
+    else:
+        today_change = 0.0
+    last_px = float(priced_only.iloc[-1])
+    ndays_change = ((last_px / open_price) - 1.0) * 100.0 if ndays > 1 else today_change
+    gained = ndays_change if ndays > 1 else today_change
+    if ndays > 1:
+        custom_info = f"五日{int_to_percentage(ndays_change)}  今日{int_to_percentage(today_change)}"
+    else:
+        custom_info = int_to_percentage(gained)
+    if quote is not None and quote.amount is not None:
+        amount_v: float | None = quote.amount
+    elif session_amount:
+        amount_v = session_amount
+    else:
+        amount_v = None
+    total_amount = number_to_chinese(amount_v) if isinstance(amount_v, float) else "—"
+    stock_name = series.symbol.display_name or "N/A"
+    stock_code = series.symbol.code
+    new_price = quote.price if quote is not None else series.points[-1].price
+    turnover_rate = quote.turnover_rate if quote is not None else None
+    turnover_text = f"{turnover_rate}%" if isinstance(turnover_rate, float) else "—"
+    name_bit = f"{stock_name} {ndays}日分时" if ndays > 1 else stock_name
+    if ndays > 1:
+        title_text = (
+            f"【{name_bit} 最新价：{new_price}】 "
+            f"五日累计：{int_to_percentage(ndays_change)} "
+            f"今日：{int_to_percentage(today_change)} "
+            f"换手率 {turnover_text} 成交额 {total_amount}"
+        )
+    else:
+        title_text = (
+            f"【{name_bit} 最新价：{new_price}】 开盘价：{open_price} "
+            f"涨跌幅：{custom_info} 换手率 {turnover_text} "
+            f"成交额 {total_amount}"
+        )
+    day_starts: list[int] = []
+    day_tick_positions: list[int] = []
+    day_tick_labels: list[str] = []
+    if ndays > 1:
+        code_id = series.symbol.provider_symbol or series.symbol.code
+        axis_prev = series.ref_close if series.ref_close is not None and series.ref_close != 0 else None
+        day_starts, day_tick_positions, day_tick_labels = _intraday_day_axis(
+            _frame_column(price_history_pd, "dt"),
+            price_column,
+            code_id=code_id,
+            prev_close=axis_prev,
+        )
+
+    return SingleStockRenderData(
+        df=price_history_pd,
+        stock_name=stock_name,
+        stock_code=stock_code,
+        new_price=new_price,
+        gained=gained,
+        custom_info=custom_info,
+        turnover_rate=turnover_rate,
+        total_amount=total_amount,
+        open_price=open_price,
+        y_axis_max_price=y_axis_max_price,
+        y_axis_min_price=y_axis_min_price,
+        max_fluctuation=max_fluctuation,
+        tick_values=tick_values,
+        tick_texts=tick_texts,
+        bar_colors=bar_colors,
+        title_text=title_text,
+        ndays=ndays,
+        day_starts=day_starts,
+        day_tick_positions=day_tick_positions,
+        day_tick_labels=day_tick_labels,
+        today_change=today_change,
+        ndays_change=ndays_change,
+    )
+
+
+# 兼容旧名
+build_single_stock_render_data_from_intraday = build_single_stock_render_data
+
+
+def build_multi_stock_render_data(
+    series_list: List[IntradaySeries],
+) -> MultiStockRenderData | DataResult:
+    import datetime as _dt
+
+    max_fluctuation = 0.0
+    processed_stocks: list[MultiStockItem] = []
+    now_bjt = _dt.datetime.now()
+
+    for series in series_list:
+        if not isinstance(series, IntradaySeries) or not series.points:
+            continue
+        rows = _session_rows_from_intraday(
+            series,
+            now_bjt=now_bjt,
+            fill_session_future=True,
+            fill_session_gaps=False,
+        )
+        if not rows:
+            continue
+
+        price_history_pd = pd.DataFrame(rows)
+        price_history_pd["dt"] = pd.to_datetime(price_history_pd["datetime"], errors="coerce")
+        price_history_pd = price_history_pd.sort_values("dt", kind="mergesort")
+        price_history_pd["price"] = _numeric_series(price_history_pd["price"])
+        price_history_pd["money"] = _numeric_series(price_history_pd["money"], fill_value=0)
+        open_price = _intraday_zero_axis(series, price_history_pd)
+        if open_price is None:
+            logger.warning(f"[SayuStock] Skipping {series.symbol.name} due to invalid open price.")
+            continue
+        price_history_pd["percentage_change"] = ((price_history_pd["price"] / open_price) - 1) * 100
+
+        change_column = _frame_column(price_history_pd, "percentage_change")
+        current_max = float(change_column.max())
+        current_min = float(change_column.min())
+        if not np.isnan(current_max):
+            max_fluctuation = max(max_fluctuation, abs(current_max))
+        if not np.isnan(current_min):
+            max_fluctuation = max(max_fluctuation, abs(current_min))
+        processed_stocks.append(
+            MultiStockItem(
+                name=series.symbol.display_name or "Unknown",
+                df=price_history_pd,
+                total_volume=float(_frame_column(price_history_pd, "money").sum()),
+            )
+        )
+
+    if not processed_stocks:
+        return ErroText["notData"]
+
+    processed_stocks.sort(key=lambda item: item.total_volume, reverse=True)
+    y_axis_max = (max_fluctuation // 2 + 1) * 2
+    y_axis_min = -y_axis_max
+    tick_values = [
+        p for p in range(int(np.floor(y_axis_min)), int(np.ceil(y_axis_max)) + 1, 2) if y_axis_min <= p <= y_axis_max
+    ]
+    subtitle_parts: list[str] = []
+    for stock in processed_stocks:
+        last_change_series = _frame_column(stock.df, "percentage_change").dropna()
+        if not last_change_series.empty:
+            last_change = float(last_change_series.iloc[-1])
+            sign = "+" if last_change >= 0 else ""
+            subtitle_parts.append(f"{stock.name}: {sign}{last_change:.2f}%")
+
+    return MultiStockRenderData(
+        stocks=processed_stocks,
+        y_axis_max=y_axis_max,
+        y_axis_min=y_axis_min,
+        tick_values=tick_values,
+        tick_texts=[f"{p}%" for p in tick_values],
+        subtitle_parts=subtitle_parts,
+    )
+
+
+def build_compare_render_data(series_list: List[KlineSeries]) -> CompareRenderData | DataResult:
+    items: list[CompareStockItem] = []
+    for index, series in enumerate(series_list):
+        if not isinstance(series, KlineSeries):
+            continue
+        df = kline_to_cn_df(series)
+        if df.empty:
+            continue
+        df = df.copy()
+        df["日期"] = pd.to_datetime(df["日期"], errors="coerce").dt.normalize()
+        df = df.dropna(subset=["日期"]).sort_values("日期")
+        df = df.drop_duplicates(subset=["日期"], keep="last").reset_index(drop=True)
+        if df.empty:
+            continue
+        trace_name = series.symbol.display_name or f"Trace {index}"
+        items.append(CompareStockItem(name=trace_name, df=df))
+    if not items:
+        return ErroText["notData"]
+    return CompareRenderData(items=items)
+
+
+def build_cloudmap_render_data(
+    snap: BoardSnapshot, market: str, sector: str | None = None, layer: int = 2
+) -> CloudmapRenderData | DataResult:
+    if not isinstance(snap, BoardSnapshot):
+        return ErroText["notData"]
+
+    all_stocks: list[dict[str, Any]] = []
+    for row in snap.rows:
+        if row.market_cap is None or row.change_pct is None or not row.name:
+            continue
+        category_name = row.industry or "-"
+        if row.name.startswith(("ST", "*ST")):
+            category_name = "ST"
+        all_stocks.append(
+            {
+                "category": category_name,
+                "name": row.name,
+                "value": float(row.market_cap),
+                "diff_val": float(row.change_pct),
+                "code": row.code,
+                "sector": sector,
+            }
+        )
+
+    if not all_stocks:
+        return ErroText["notData"]
+
+    grouped_by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for stock in all_stocks:
+        grouped_by_category[str(stock["category"])].append(stock)
+
+    # 行业/概念快照已是目标板块成分；hotmap 才按 L1 名过滤，这里不能再筛
+    if market in {"大盘云图", "概念云图", "行业云图"}:
+        categories_to_process = list(grouped_by_category.keys())
+    elif sector is not None and sector in grouped_by_category:
+        categories_to_process = [sector]
+    else:
+        categories_to_process = []
+        for item in grouped_by_category.keys():
+            if sector and sector in item:
+                categories_to_process = [item]
+                break
+        if not categories_to_process:
+            return ErroText["notData"]
+
+    final_stock_list: list[dict[str, Any]] = []
+    for cat_name in categories_to_process:
+        stock_items = grouped_by_category[cat_name]
+        num_items = len(stock_items)
+        if layer == 1:
+            num_to_extract = num_items
+        else:
+            if num_items <= 40:
+                fit = 0.6
+            elif num_items <= 100:
+                fit = 0.4
+            elif num_items <= 200:
+                fit = 0.3
+            else:
+                fit = 0.2
+            ideal_count = math.ceil(num_items * fit)
+            clamped_count = max(3, min(ideal_count, 15))
+            num_to_extract = min(clamped_count, num_items)
+        sorted_stocks = sorted(stock_items, key=lambda x: float(x["value"]), reverse=True)
+        final_stock_list.extend(sorted_stocks[:num_to_extract])
+
+    if not final_stock_list:
+        return ErroText["notData"]
+
+    df = _sort_df(pd.DataFrame(final_stock_list), "value", ascending=False)
+    df = _reset_df(df, drop=True)
+    if layer == 1:
+        treemap_path = ["sector", "category", "name"]
+    else:
+        treemap_path = ["category", "name"]
+
+    title = market if market else "板块云图"
+    if sector and market not in ("大盘云图",):
+        title = f"{market} - {sector}"
+
+    return CloudmapRenderData(df=df, title=title, treemap_path=treemap_path)
+
+
+# ---------------------------------------------------------------------------
+# IPO 日历（T-2 ~ T+7）
+# ---------------------------------------------------------------------------
+
+IPO_WINDOW_BEFORE = 2
+IPO_WINDOW_AFTER = 7
+
+_MARKET_LABEL: dict[IpoMarket, str] = {IpoMarket.CN: "A股", IpoMarket.HK: "港股", IpoMarket.US: "美股"}
+# 与全天候时间轴同源的市场配色
+_MARKET_COLOR: dict[IpoMarket, str] = {
+    IpoMarket.CN: "#ef4444",
+    IpoMarket.HK: "#d946ef",
+    IpoMarket.US: "#60a5fa",
+}
+
+
+@dataclass(slots=True)
+class IpoCalendarRow:
+    """窗口内一行：位置为窗口内天数索引（0..span），越界日期夹到边缘。"""
+
+    market: IpoMarket
+    stage: IpoStage
+    name: str
+    display_name: str
+    code: str
+    board: str | None
+    apply_date: date | None
+    apply_end_date: date | None
+    ballot_date: date | None
+    pay_date: date | None
+    grey_market_date: date | None
+    listing_date: date | None
+    filed_date: date | None
+    issue_price: float | None
+    issue_price_text: str | None
+    raise_yi: float | None
+    currency: str
+    first_day_change: float | None
+    oversubscription: float | None
+    apply_start_pos: float | None
+    apply_pos: float | None
+    apply_end_pos: float | None
+    ballot_pos: float | None
+    pay_pos: float | None
+    grey_pos: float | None
+    listing_pos: float | None
+    filed_pos: float | None
+
+
+@dataclass(slots=True)
+class IpoCalendarGroup:
+    market: IpoMarket
+    label: str
+    color: str
+    rows: list[IpoCalendarRow]
+
+
+@dataclass(slots=True)
+class IpoCalendarRenderData:
+    anchor: date
+    window_start: date
+    window_end: date
+    span_days: int
+    days: tuple[date, ...]
+    groups: list[IpoCalendarGroup]
+    total: int
+
+
+def _ipo_pos(value: date | None, start: date, span: int) -> float | None:
+    """日期 → 窗口内索引；窗口外夹到 [0, span]。"""
+    if value is None:
+        return None
+    idx = (value - start).days
+    return max(0.0, min(float(idx), float(span)))
+
+
+def build_ipo_calendar_render_data(
+    events: List[IpoEvent],
+    *,
+    anchor: date | None = None,
+    markets: Sequence[IpoMarket | str] | None = None,
+    before: int = IPO_WINDOW_BEFORE,
+    after: int = IPO_WINDOW_AFTER,
+) -> IpoCalendarRenderData:
+    """IpoEvent 列表 → 窗口渲染数据（供应商无关、纯逻辑可单测）。
+
+    只保留 apply/listing/filed 任一日期落在 [anchor-before, anchor+after] 的事件；
+    阶段按 anchor 推导（``IpoEvent.stage_on``）。
+    """
+    from .market.enums import coerce_ipo_market
+
+    a = anchor or date.today()
+    start = a - timedelta(days=before)
+    end = a + timedelta(days=after)
+    span = (end - start).days
+
+    selected: set[IpoMarket] = set(IpoMarket)
+    if markets:
+        picked = {coerce_ipo_market(m) for m in markets}
+        selected = {m for m in picked if m is not None}
+    if not selected:
+        selected = set(IpoMarket)
+
+    def _in_window(value: date | None) -> bool:
+        return value is not None and start <= value <= end
+
+    groups: list[IpoCalendarGroup] = []
+    total = 0
+    for m in (IpoMarket.CN, IpoMarket.HK, IpoMarket.US):
+        if m not in selected:
+            continue
+        rows: list[IpoCalendarRow] = []
+        for ev in events:
+            if ev.market != m:
+                continue
+            if not any(
+                _in_window(d)
+                for d in (
+                    ev.apply_date,
+                    ev.apply_end_date,
+                    ev.ballot_date,
+                    ev.pay_date,
+                    ev.grey_market_date,
+                    ev.listing_date,
+                    ev.filed_date,
+                )
+            ):
+                continue
+            # 港股招股期只有截止日时，按港股惯例前推 3 天作为申购窗口起点（仅影响画条）
+            apply_end = ev.apply_end_date or ev.apply_date
+            if ev.apply_date is not None:
+                apply_start = ev.apply_date
+            elif ev.apply_end_date is not None:
+                apply_start = ev.apply_end_date - timedelta(days=3)
+            else:
+                apply_start = None
+            rows.append(
+                IpoCalendarRow(
+                    market=m,
+                    stage=ev.stage_on(a),
+                    name=ev.name,
+                    # 美股公司名动辄 25+ 字符，主名一律用 ticker，全名进副标题；
+                    # 纳斯达克源已申报行可能未分到代码，回退公司名
+                    display_name=(ev.code or ev.name) if m == IpoMarket.US else ev.name,
+                    code=ev.code,
+                    board=ev.board,
+                    apply_date=ev.apply_date,
+                    apply_end_date=ev.apply_end_date,
+                    ballot_date=ev.ballot_date,
+                    pay_date=ev.pay_date,
+                    grey_market_date=ev.grey_market_date,
+                    listing_date=ev.listing_date,
+                    filed_date=ev.filed_date,
+                    issue_price=ev.issue_price,
+                    issue_price_text=ev.issue_price_text,
+                    raise_yi=ev.raise_yi,
+                    currency=ev.currency,
+                    first_day_change=ev.first_day_change,
+                    oversubscription=ev.oversubscription,
+                    apply_start_pos=_ipo_pos(apply_start, start, span),
+                    apply_pos=_ipo_pos(ev.apply_date, start, span),
+                    apply_end_pos=_ipo_pos(apply_end, start, span),
+                    ballot_pos=_ipo_pos(ev.ballot_date, start, span),
+                    pay_pos=_ipo_pos(ev.pay_date, start, span),
+                    grey_pos=_ipo_pos(ev.grey_market_date, start, span),
+                    listing_pos=_ipo_pos(ev.listing_date, start, span),
+                    filed_pos=_ipo_pos(ev.filed_date, start, span),
+                )
+            )
+
+        def _row_key(r: IpoCalendarRow) -> tuple[date, str]:
+            primary = r.listing_date or r.filed_date or r.apply_date
+            return (primary or date.max, r.code)
+
+        rows.sort(key=_row_key)
+        total += len(rows)
+        groups.append(IpoCalendarGroup(market=m, label=_MARKET_LABEL[m], color=_MARKET_COLOR[m], rows=rows))
+
+    days = tuple(start + timedelta(days=i) for i in range(span + 1))
+    return IpoCalendarRenderData(
+        anchor=a,
+        window_start=start,
+        window_end=end,
+        span_days=span,
+        days=days,
+        groups=groups,
+        total=total,
+    )

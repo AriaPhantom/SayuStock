@@ -675,12 +675,22 @@ testnb2/
 
 em_data
 
-### Testing & Debugging ###
+examples
+uv.lock
+
+### Local render previews ###
+test_output/
+docs/paper
+.commandcode
+preview_output/
+### VPS local (AriaPhantom fork) ###
+# 本机测试/渲染产物的临时垃圾。注意：**不要**在这里写 test/test_*.py——
+# 上游 test/ 下有 84 个真实测试文件（test_*.py），整类忽略会让上游新增的测试
+# 悄悄变成 untracked，本地看不见也提交不上去。
 test/*.png
 test/vps_*
 test/mock_*
 test/all_weather_*
 test/finalize_promax.py
 test/run_real_data.py
-test/test_*.py
-!test/single_stock_test.py
+test_convert_list.py

@@ -3,7 +3,7 @@
 <p align="center">
   <a href="https://github.com/KimigaiiWuyi/SayuStock"><img src="./ICON.png" width="256" height="256" alt="SayuStock"></a>
 </p>
-<h1 align = "center">早柚股票 SayuStock 0.7</h1>
+<h1 align = "center">早柚股票 SayuStock 0.8</h1>
 <h4 align = "center">🚧支持QQ群/频道、OneBot、微信、KOOK、Tg、飞书、DoDo、米游社、Discord的股票Bot插件🚧</h4>
 <div align = "center">
         <a href="http://docs.gsuid.gbots.work/#/" target="_blank">安装文档</a>
@@ -57,6 +57,10 @@
 
 <details><summary>我的自选 (添加自选)</summary><p>
 <a><img src="https://s2.loli.net/2025/02/23/k1AOeTfxtPZHluo.jpg"></a>
+</p></details>
+
+<details><summary>个股 五日 贵州茅台（5日 / 五日分时，分时线不是K线）</summary><p>
+五日分时走东财 trends2 <code>ndays=5</code>（push2his），图上按交易日分隔。
 </p></details>
 
 <details><summary>个股 日k 东方财富（周k、月k、年k）</summary><p>

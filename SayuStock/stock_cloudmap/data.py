@@ -1,0 +1,79 @@
+"""云图数据编排：只返回 BoardSnapshot，不经 compat 编码。"""
+
+from __future__ import annotations
+
+from typing import List, Union, Optional
+from datetime import datetime
+from dataclasses import dataclass
+
+from ..utils.market import get_market, is_market_error
+from ..utils.constant import bk_dict, market_dict
+from ..utils.market.models import KlineSeries, BoardSnapshot, IntradaySeries
+from ..utils.sector_resolve import fetch_named_board
+
+MarketPayload = BoardSnapshot | IntradaySeries | KlineSeries
+CloudMapRawData = Union[MarketPayload, str]
+
+
+@dataclass
+class CloudMapDataResult:
+    """云图渲染前的数据聚合结果。"""
+
+    raw_data: CloudMapRawData
+    raw_datas: List[IntradaySeries | KlineSeries]
+    sector: Optional[str]
+    special_cache_key: Optional[str]
+
+
+class CloudMapDataService:
+    """大盘/行业/概念云图数据请求，只走 MarketDataPort。"""
+
+    async def fetch(
+        self,
+        market: str,
+        sector: Optional[str],
+        start_time: Optional[datetime],
+        end_time: Optional[datetime],
+    ) -> CloudMapDataResult:
+        _ = start_time, end_time
+        resolved_sector = self.resolve_sector(market, sector)
+        raw_datas: List[IntradaySeries | KlineSeries] = []
+        special_cache_key: Optional[str] = None
+        port = get_market()
+
+        if market == "大盘云图":
+            if resolved_sector:
+                snap = await port.board(resolved_sector, limit=None, sort_asc=False)
+            else:
+                snap = await port.hotmap()
+            raw_data: CloudMapRawData = snap.message if is_market_error(snap) else snap
+        elif market == "行业云图":
+            if resolved_sector:
+                # 成分名单 30 天缓存（一/二级走本地表）；行情只复用大盘 hotmap
+                resolved_sector, raw_data = await fetch_named_board("industry", resolved_sector)
+            else:
+                raw_data = "行业云图需要后跟行业名称, 例如： 行业云图 水泥"
+        elif market == "概念云图":
+            if resolved_sector:
+                resolved_sector, raw_data = await self.fetch_concept(resolved_sector)
+            else:
+                raw_data = "概念云图需要后跟概念类型, 例如： 概念云图 华为欧拉"
+        else:
+            snap = await port.board(market, limit=100, sort_asc=False)
+            raw_data = snap.message if is_market_error(snap) else snap
+
+        return CloudMapDataResult(raw_data, raw_datas, resolved_sector, special_cache_key)
+
+    def resolve_sector(self, market: str, sector: Optional[str]) -> Optional[str]:
+        if sector != "single-stock":
+            if market in market_dict and "b:" in market_dict[market]:
+                return market
+            if market in bk_dict:
+                return market
+        return sector
+
+    async def fetch_concept(self, sector: str) -> tuple[str, CloudMapRawData]:
+        return await fetch_named_board("concept", sector)
+
+
+CLOUDMAP_DATA_SERVICE = CloudMapDataService()

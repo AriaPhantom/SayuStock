@@ -1,149 +1,20 @@
-import json
-import random
 import asyncio
-from typing import Any, Dict, List, Tuple, Union, Literal, Optional
-from datetime import datetime, timedelta
-
-import aiofiles
-from yarl import URL
-from aiohttp import (
-    FormData,
-    TCPConnector,
-    ClientSession,
-    ClientTimeout,
-    ContentTypeError,
-    ServerDisconnectedError,
-)
-from playwright.async_api import async_playwright
+from typing import Any, Dict, List, Tuple, Union, Optional
+from datetime import datetime
 
 from gsuid_core.logger import logger
 
-from .utils import async_file_cache, calculate_difference
-from .get_vix import get_vix_data
-from ..get_OKX import analyze_market_target, get_crypto_trend_as_json, get_crypto_history_kline_as_json
-from ..constant import (
-    UA,
-    SINGLE_LINE_FIELDS1,
-    SINGLE_LINE_FIELDS2,
-    SINGLE_STOCK_FIELDS,
-    ErroText,
-    market_dict,
-    header_simple,
-    chinese_stocks,
-    request_header,
-    trade_detail_dict,
-)
-from ..load_data import get_full_security_code
-from .request_utils import get_code_id
-from ..resource_path import MAIN_PATH
-
-MENU_CACHE = {}
-DC_TOKEN = ""
-LAST_DC_REFRESH = datetime.min
-LAST_DC_FAILURE = datetime.min
-NOW_QUEUE = 0
-DC_TOKEN_LOCK: Optional[asyncio.Lock] = None
-DC_TOKEN_FILE = MAIN_PATH / "dc_token.json"
-DC_TOKEN_EXPIRE_FALLBACK = timedelta(days=7)
-DC_TOKEN_EXPIRE_SAFETY = timedelta(minutes=5)
-DC_FORCE_REFRESH_COOLDOWN = timedelta(seconds=60)
-LAST_TURNOVER_TRENDS_FAILURE = datetime.min
-TURNOVER_TRENDS_FAILURE_COOLDOWN = timedelta(minutes=2)
-
-
-def _need_dc_token(url: str) -> bool:
-    return url.startswith(
-        (
-            "https://push2.eastmoney.com/api/qt/stock/",
-            "https://push2his.eastmoney.com/api/qt/stock/",
-        )
-    )
-
-
-def _parse_dc_token_expire(value: Any) -> Optional[datetime]:
-    if not isinstance(value, str) or not value:
-        return None
-
-    try:
-        expire_at = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-    if expire_at.tzinfo is not None:
-        expire_at = expire_at.astimezone().replace(tzinfo=None)
-    return expire_at
-
-
-def _get_cookie_expire(cookies: List[Dict[str, Any]]) -> datetime:
-    expire_times = []
-    for cookie in cookies:
-        raw_expire = cookie.get("expires")
-        if isinstance(raw_expire, (int, float)) and raw_expire > 0:
-            try:
-                expire_times.append(datetime.fromtimestamp(raw_expire))
-            except (OverflowError, OSError, ValueError):
-                continue
-
-    if expire_times:
-        return max(expire_times)
-    return datetime.now() + DC_TOKEN_EXPIRE_FALLBACK
-
-
-async def _load_persisted_dc_token() -> str:
-    if not DC_TOKEN_FILE.exists():
-        return ""
-
-    try:
-        async with aiofiles.open(DC_TOKEN_FILE, mode="r", encoding="utf-8") as f:
-            content = await f.read()
-        payload = json.loads(content)
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(f"[SayuStock] 读取持久化 DC-Token 失败: {e}")
-        return ""
-
-    token = payload.get("cookie", "")
-    expire_at = _parse_dc_token_expire(payload.get("expire_at"))
-    if not token or expire_at is None:
-        return ""
-
-    if expire_at - datetime.now() <= DC_TOKEN_EXPIRE_SAFETY:
-        logger.info("[SayuStock] 持久化 DC-Token 已过期或接近过期，跳过使用。")
-        return ""
-
-    logger.info("[SayuStock] 命中持久化 DC-Token，跳过 Playwright 启动。")
-    return token
-
-
-async def _save_persisted_dc_token(token: str, expire_at: datetime) -> None:
-    if not token:
-        return
-
-    payload = {
-        "cookie": token,
-        "expire_at": expire_at.isoformat(),
-        "updated_at": datetime.now().isoformat(),
-    }
-    try:
-        async with aiofiles.open(DC_TOKEN_FILE, mode="w", encoding="utf-8") as f:
-            await f.write(json.dumps(payload, ensure_ascii=False, indent=2))
-        logger.info(f"[SayuStock] DC-Token 已持久化至 {DC_TOKEN_FILE}")
-    except OSError as e:
-        logger.warning(f"[SayuStock] 写入持久化 DC-Token 失败: {e}")
+from .utils import calculate_difference
+from ..market import KlinePeriod, get_market, is_market_error
+from ..eastmoney import EASTMONEY_REQUESTER
+from ..stock_period import is_intraday_sector, intraday_ndays_from_sector
+from ..market.models import KlineSeries, BoardSnapshot, IntradaySeries
 
 
 async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
-    global LAST_TURNOVER_TRENDS_FAILURE
-
-    if datetime.now() - LAST_TURNOVER_TRENDS_FAILURE < TURNOVER_TRENDS_FAILURE_COOLDOWN:
-        snapshot_amount = await _get_market_turnover_snapshot()
-        if snapshot_amount > 0:
-            logger.info("[SayuStock] 分时成交额端点冷却中，直接使用 clist 快照。")
-            return snapshot_amount, 0, None
-
-    URL = "http://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
+    URL = "https://push2his.eastmoney.com/api/qt/stock/trends2/get"  # noqa: E501
     y = 0
     ya = 0
-    success_count = 0
     last_trade_date: Optional[datetime] = None
     for mk in ["1.000001", "0.399001"]:
         params = {
@@ -152,7 +23,7 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
             "ndays": "2",
             "secid": mk,
         }
-        data = await stock_request(
+        data = await EASTMONEY_REQUESTER.stock_request(
             URL,
             "GET",
             params=params,
@@ -160,73 +31,14 @@ async def get_hours_from_em() -> Tuple[float, float, Optional[datetime]]:
         if isinstance(data, int):
             logger.warning(f"[SayuStock] 获取{mk}数据失败, 错误码: {data}")
             continue
-
-        data_payload = data.get("data") if isinstance(data, dict) else None
-        trends = data_payload.get("trends") if isinstance(data_payload, dict) else None
-        if not isinstance(trends, list) or not trends:
-            logger.warning(f"[SayuStock] 获取{mk}分时成交额失败，返回数据为空")
-            continue
-
-        try:
-            ya0, y0, ltd = calculate_difference(trends)
-        except (IndexError, KeyError, TypeError, ValueError) as e:
-            logger.warning(f"[SayuStock] 解析{mk}分时成交额失败: {e}")
-            continue
-
+        ya0, y0, ltd = calculate_difference(data["data"]["trends"])
         y += y0
         ya += ya0
-        success_count += 1
-        if ltd is not None:
-            last_trade_date = ltd
-
-    if success_count < 2:
-        LAST_TURNOVER_TRENDS_FAILURE = datetime.now()
-        snapshot_amount = await _get_market_turnover_snapshot()
-        if snapshot_amount > 0:
-            logger.info("[SayuStock] 使用 clist 快照修正大盘概览成交额。")
-            return snapshot_amount, 0, last_trade_date
-
+        last_trade_date = ltd
     return ya, y, last_trade_date
 
 
-async def _get_market_turnover_snapshot() -> float:
-    url = "http://push2.eastmoney.com/api/qt/clist/get"
-    params = [
-        ("pz", "2"),
-        ("po", "1"),
-        ("np", "1"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", "f3"),
-        ("pn", "1"),
-        ("fs", "i:1.000001,i:0.399001"),
-        ("fields", "f12,f14,f6"),
-    ]
-    resp = await stock_request(url, "GET", params=params)
-    if isinstance(resp, int):
-        logger.warning(f"[SayuStock] 获取大盘成交额快照失败, 错误码: {resp}")
-        return 0
-
-    data = resp.get("data") if isinstance(resp, dict) else None
-    diff = data.get("diff") if isinstance(data, dict) else None
-    if not isinstance(diff, list):
-        logger.warning("[SayuStock] 获取大盘成交额快照失败，返回数据为空")
-        return 0
-
-    total = 0.0
-    for item in diff:
-        if not isinstance(item, dict):
-            continue
-        amount = item.get("f6", 0)
-        try:
-            total += float(amount)
-        except (TypeError, ValueError):
-            continue
-
-    return total
-
-
-async def get_bar():
+async def get_bar() -> dict[str, object] | str:
     URL = "https://quotederivates.eastmoney.com/datacenter/updowndistribution"
     PARAMS = {
         "mcodelist": "0.399002,1.000002,0.899050",
@@ -234,115 +46,41 @@ async def get_bar():
         "cver": "10.36.2",
     }
 
-    resp = await stock_request(
+    resp = await EASTMONEY_REQUESTER.stock_request(
         URL,
         params=PARAMS,
     )
 
     if isinstance(resp, int):
         return f"[SayuStock] 请求错误：{resp}"
-    return resp
+    if isinstance(resp, dict):
+        return resp
+    return f"[SayuStock] 请求错误：意外响应类型 {type(resp).__name__}"
 
 
-async def get_menu(mode: int = 3) -> Dict:
+async def get_menu(mode: int = 3) -> Dict[str, str]:
+    """获取东方财富板块菜单。
+
+    Args:
+        mode: `2` 为行业板块，`3` 为概念板块。
+
+    Returns:
+        板块名称到板块代码的映射。
     """
-    mode = 2 为行业板块
-    mode = 3 为概念板块
-    """
-    now = datetime.now().strftime("%Y%m%d")
-    if now in MENU_CACHE:
-        return MENU_CACHE[now][mode]
-
-    URL = "https://quote.eastmoney.com/center/api/sidemenu_new.json"
-    data = await stock_request(URL)
-    if isinstance(data, int):
-        raise Exception(f"[SayuStock] 请求错误：{data}")
-
-    hyr = {}
-    gnr = {}
-    for i in data["bklist"]:
-        if i["type"] == 2:
-            hyr[i["name"]] = i["code"]
-        elif i["type"] == 3:
-            gnr[i["name"]] = i["code"]
-
-    MENU_CACHE[now] = {2: hyr, 3: gnr}
-
-    if len(MENU_CACHE) > 1:
-        # 删除旧项，保留最新的
-        keys_to_remove = list(MENU_CACHE.keys())[:-1]
-        for key in keys_to_remove:
-            del MENU_CACHE[key]
-
-    return MENU_CACHE[now][mode]
+    return await EASTMONEY_REQUESTER.get_menu(mode)
 
 
-@async_file_cache(market="vix_market", sector="{vix_name}", suffix="json")
-async def get_vix(vix_name: str):
-    trends = await get_vix_data(vix_name)
-    if isinstance(trends, str):
-        return trends
-
-    price_change_percent = 0.0
-    # 确保趋势数据非空且开盘价不为0，以避免除零错误
-    if len(trends) > 0:
-        latest_price = trends[-1]["price"]
-        open_price = trends[0]["open"] if trends[0]["open"] != 0 else trends[0]["price"]
-
-        price_change_percent: float = ((latest_price - open_price) / open_price) * 100  # type: ignore
-
-    resp = {
-        "data": {
-            "f43": trends[-1]["price"],
-            "f44": trends[-1]["price"],
-            "f58": vix_name,
-            "f60": open_price,
-            "f48": 0,
-            "f168": 0,
-            "f170": round(float(price_change_percent), 2),
-        },
-        "trends": trends,
-    }
-
-    return resp
+async def get_vix(vix_name: str) -> IntradaySeries | str:
+    """VIX → IntradaySeries（经 MarketDataPort；源数据缓存在 get_vix_data）。"""
+    series = await get_market().intraday(vix_name)
+    if is_market_error(series):
+        return series.message
+    return series
 
 
-async def get_single_fig_data(secid: str):
-    params = []
-    url = "http://push2.eastmoney.com/api/qt/stock/trends2/get"
-    fields1 = ",".join(SINGLE_LINE_FIELDS1)
-    fields2 = ",".join(SINGLE_LINE_FIELDS2)
-    params.append(("fields1", fields1))
-    params.append(("fields2", fields2))
-    params.append(("secid", secid))
-    resp = await stock_request(url, params=params)
-
-    if isinstance(resp, int):
-        return f"[SayuStock] 请求错误, 错误码: {resp}！"
-    if resp["data"] is None:
-        return ErroText["notStock"]
-
-    stock_line_data: list[str] = resp["data"]["trends"]
-    stock_data: list[Dict[str, Union[str, float, int]]] = []
-    for item in stock_line_data:
-        # 原始数据格式
-        # "2024-12-31 14:05,15.63,15.62,15.63,15.61,3300,5154770.00,15.672"
-        parts = item.split(",")
-        # 原始时间格式为'2024-12-31 14:05'
-        datetime = parts[0].split(" ") if len(parts[0]) > 0 else ["", ""]
-        stock_data.append(
-            {
-                "datetime": datetime[1],
-                "price": float(parts[1]),
-                "open": float(parts[2]),
-                "high": float(parts[3]),
-                "low": float(parts[4]),
-                "amount": int(parts[5]),
-                "money": float(parts[6]),
-                "avg_price": float(parts[7]),
-            }
-        )
-    return stock_data
+async def get_single_fig_data(secid: str) -> Union[List[Dict[str, Union[str, float, int]]], str]:
+    """获取个股当日分时走势。"""
+    return await EASTMONEY_REQUESTER.get_stock_trends(secid)
 
 
 async def get_gg(
@@ -350,471 +88,98 @@ async def get_gg(
     sector: str,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
-):
-    logger.info(f"[SayuStock] get_single_fig_data code: {market}")
+) -> IntradaySeries | KlineSeries | str:
+    """个股分时/K 线入口：直接返回领域模型。"""
+    logger.info(f"[SayuStock] get_gg code: {market} sector: {sector}")
+    port = get_market()
 
-    _type, formatted_code = analyze_market_target(market)
+    if is_intraday_sector(sector):
+        ndays = intraday_ndays_from_sector(sector)
+        if ndays is None:
+            ndays = 1
+        series = await port.intraday(market, ndays=ndays)
+        if is_market_error(series):
+            return series.message
+        return series
 
-    if _type == "crypto":
-        pass
-    else:
-        sec_id_data = await get_code_id(market)
-        if sec_id_data is None:
-            return ErroText["notStock"]
-
-        sec_id = get_full_security_code(sec_id_data[0])
-        if sec_id is None:
-            return ErroText["notStock"]
-
-    if sector == "single-stock":
-        if _type == "crypto":
-            result = await get_crypto_trend_as_json(formatted_code)
-        else:
-            result = await _get_gg(sec_id, sec_id_data[2])
-    elif sector.startswith("single-stock-kline"):
+    if sector.startswith("single-stock-kline"):
         kline_code = sector.split("-")[-1]
-        if kline_code == "100":
-            kline_code = 101
-            out_day = 50
-        elif kline_code == "101":
-            out_day = 260
-        elif kline_code == "102":
-            out_day = 800
-        elif kline_code == "103":
-            out_day = 2000
-        elif kline_code == "104":
-            out_day = 4000
-        elif kline_code == "105":
-            out_day = 6000
-        elif kline_code == "106":
-            out_day = 10000
-        elif kline_code == "111":
-            kline_code = 101
-            out_day = 365
-        elif kline_code == "30":
-            out_day = 60
-        elif kline_code == "60":
-            out_day = 100
-        elif kline_code == "15":
-            out_day = 40
-        elif kline_code == "5":
-            out_day = 30
-        else:
-            out_day = 1600
+        try:
+            period = KlinePeriod(kline_code)
+        except ValueError:
+            period = KlinePeriod.D1
+        start_d = start_time.date() if start_time is not None else None
+        end_d = end_time.date() if end_time is not None else None
+        series_k = await port.kline(market, period, start=start_d, end=end_d)
+        if is_market_error(series_k):
+            return series_k.message
+        return series_k
 
-        if start_time is None:
-            start_time = datetime.now() - timedelta(days=out_day)
-        if end_time is None:
-            end_time = datetime.now()
-        st_f = start_time.strftime("%Y%m%d") if start_time else ""
-        et_f = end_time.strftime("%Y%m%d") if end_time else ""
-
-        if _type == "crypto":
-            result = await get_crypto_history_kline_as_json(
-                market,
-                str(kline_code),
-                st_f,
-                et_f,
-            )
-        else:
-            result = await _get_gg_kline(
-                sec_id,
-                sec_id_data[2],
-                kline_code,
-                st_f,
-                et_f,
-            )
-    else:
-        result = {}
-
-    return result
+    return "未知 sector"
 
 
-# 个股
-@async_file_cache(market="{sec_id}", sector="single-stock", suffix="json")
-async def _get_gg(sec_id: str, sec_type: str):
-    params = [
-        ("pz", "200"),
-        ("po", "1"),
-        ("np", "1"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", "f3"),
-        ("pn", "1"),
-    ]
-
-    fields = ",".join(SINGLE_STOCK_FIELDS)
-    url = "http://push2.eastmoney.com/api/qt/stock/get"
+async def _get_gg(sec_id: str, sec_type: str) -> Union[Dict[str, Any], str]:
+    """获取个股实时盘口并合并当日分时（底层 HTTP，仅 adapter 使用）。"""
     logger.info(f"[SayuStock] get_single_fig_data secid: {sec_id}")
-    params.append(("secid", sec_id))
-    params.append(("fields", fields))
-
-    resp = await stock_request(url, "GET", params=params)
-    if isinstance(resp, int):
-        return f"[SayuStock] 请求错误, 错误码: {resp}！"
-
-    # 处理获取个股数据错误
-    if resp["data"] is None:
-        return ErroText["notStock"]
-
-    secid = next((value for key, value in params if key == "secid"), None)
-    if secid:
-        trends = await get_single_fig_data(secid)
-        if isinstance(trends, str):
-            return resp
-        resp["trends"] = trends
-
-    resp["data"]["f58"] = f"{resp['data']['f58']} ({sec_type})"
-
-    return resp
+    return await EASTMONEY_REQUESTER.get_single_stock(sec_id, sec_type)
 
 
-# 个股 日K
-@async_file_cache(
-    market="{sec_id}",
-    sector="single-stock-kline-{kline_code}",
-    suffix="json",
-    sp="{start_time}-{end_time}",
-)
 async def _get_gg_kline(
     sec_id: str,
     sec_type: str,
     kline_code: Union[str, int],
     start_time: str,
     end_time: str,
-):
-    url = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+) -> Union[Dict[str, Any], str]:
+    """获取个股历史 K 线（底层 HTTP，仅 adapter 使用）。"""
     logger.info(f"[SayuStock] get_single_fig_data secid: {sec_id}")
-    params = [
-        ("fields1", "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"),
-        ("fields2", "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"),
-        ("rtntype", "6"),
-        ("klt", kline_code),
-        ("fqt", "1"),
-        ("secid", sec_id),
-        ("beg", start_time),
-        ("end", end_time),
-    ]
-
-    resp = await stock_request(url, "GET", params=params)
-    if isinstance(resp, int):
-        return f"[SayuStock] 请求错误, 错误码: {resp}！"
-
-    if resp["data"] is None:
-        return ErroText["notStock"]
-
-    resp["data"]["name"] = f"{resp['data']['name']} ({sec_type})"
-
-    return resp
+    return await EASTMONEY_REQUESTER.get_stock_kline(sec_id, sec_type, kline_code, start_time, end_time)
 
 
-# 大盘云图等批量性
-@async_file_cache(
-    market="{market}",
-    sector="{po}",
-    suffix="json",
-    sp="{is_loop}-{pz}",
-)
 async def get_mtdata(
     market: str,
     is_loop: bool = False,
-    po: int = 1,  # 0为倒序，1为正序
+    po: int = 1,
     pz: int = 20,
-):
-    params = [
-        ("pz", str(pz)),
-        ("po", str(po)),
-        ("np", "1"),
-        ("fltt", "2"),
-        ("invt", "2"),
-        ("fid", "f3"),
-        ("pn", "1"),
-    ]
+) -> BoardSnapshot | str:
+    """获取行情列表/板块成分列表（领域模型）。"""
+    port = get_market()
+    if is_loop:
+        # 全量拉取仍走 requester 分页，再解析为 BoardSnapshot
+        raw = await EASTMONEY_REQUESTER.get_market_list(market, is_loop, po, pz)
+        if isinstance(raw, str):
+            return raw
+        from ..market.enums import BoardKind
+        from ..market.adapters.eastmoney.parse_board import parse_board_payload
 
-    url = "http://push2.eastmoney.com/api/qt/clist/get"
-    if market in market_dict:
-        fs = market_dict[market]
-    else:
-        fs = market
-
-    fields = ",".join(trade_detail_dict.keys())
-    if fs.startswith(("bk", "BK")):
-        fs = f"b:{fs}"
-    params.append(("fs", fs))
-    params.append(("fields", fields))
-
-    resp = await stock_request(url, "GET", params=params)
-    if isinstance(resp, int):
-        return f"[SayuStock] 错误代码: {resp}"
-
-    if is_loop and resp["data"] and len(resp["data"]["diff"]) >= 100:
-        stop_event = asyncio.Event()
-        pn = 2
-        TASK = []
-        params.remove(("pn", "1"))
-        params.remove(("pz", "100"))
-        params.append(("pz", str(len(resp["data"]["diff"]))))
-
-        while not stop_event.is_set():
-            for _ in range(10):
-                _params = params.copy()
-                _params.append(("pn", str(pn)))
-                TASK.append(_get_data(resp, url, _params, stop_event))
-                pn += 1
-            await asyncio.gather(*TASK)
-            TASK.clear()
-
-        await asyncio.gather(*TASK)
-
-    return resp
+        snap = parse_board_payload(raw, kind=BoardKind.OTHER, title=market)
+        if is_market_error(snap):
+            return snap.message
+        return snap
+    snap = await port.board(market, limit=pz, sort_asc=po == 1)
+    if is_market_error(snap):
+        return snap.message
+    return snap
 
 
 async def _get_data(
-    resp: Dict,
+    resp: Dict[str, Any],
     url: str,
     params: List[tuple],
     stop_event: asyncio.Event,
-):
-    if stop_event.is_set():
-        return None
-    await asyncio.sleep(random.uniform(0.4, 0.9))
-    resp2 = await stock_request(url, params=params)
-    if isinstance(resp2, int):
-        return stop_event.set()
-
-    if "code" not in resp2 and resp2["data"]:
-        resp["data"]["diff"].extend(resp2["data"]["diff"])
-        if len(resp2["data"]["diff"]) < 100:
-            stop_event.set()
-    else:
-        stop_event.set()
+) -> None:
+    """兼容旧内部分页函数，实际分页逻辑已迁移到请求类。"""
+    await EASTMONEY_REQUESTER._append_market_page(resp, url, params, stop_event)
 
 
-@async_file_cache(
-    market="大盘云图",
-    sector="大盘云图",
-    suffix="json",
-)
-async def get_hotmap():
-    URL = "https://quote.eastmoney.com/stockhotmap/api/getquotedata"
-    resp = await stock_request(URL)
-    if isinstance(resp, int):
-        return f"[SayuStock] 错误代码: {resp}"
-
-    bk: List[str] = []
-    for i in resp["data"]:
-        assert isinstance(i, str)
-        data = i.split("|")
-        bk.append(data[0])
-
-    result = {
-        "rc": 0,
-        "rt": 6,
-        "svr": 180606397,
-        "lt": 1,
-        "full": 1,
-        "dlmkts": "",
-        "data": {"total": 0, "diff": []},
-    }
-
-    for i in resp["data"]:
-        assert isinstance(i, str)
-        if "|" in i:
-            data = i.split("|")
-            diff = {
-                # 最新
-                "f2": float(data[12]) / 100 if data[12] != "-" else 0,
-                # 涨幅
-                "f3": float(data[3]) / 100 if data[3] != "-" else 0,
-                # 成交额
-                "f6": float(data[10]) if data[10] != "-" else 0,
-                # 代码
-                "f12": data[1],
-                # 名称
-                "f14": chinese_stocks.get(data[1], {"name": data[1]})["name"],
-                # 市值
-                "f20": float(data[13]) * 100000 if data[13] != "-" else 0,
-                # 所属板块
-                "f100": chinese_stocks.get(data[1], {"industry_l1": data[1]})["industry_l1"],
-                # 不知道是啥, 先注释
-                # "dd": data[4][1:-1].split(","),
-            }
-            result["data"]["diff"].append(diff)
-
-    result["data"]["total"] = len(result["data"]["diff"])
-    return result
+async def get_hotmap() -> BoardSnapshot | str:
+    """获取大盘云图 BoardSnapshot。"""
+    snap = await get_market().hotmap()
+    if is_market_error(snap):
+        return snap.message
+    return snap
 
 
-async def stock_request(
-    url: str,
-    method: Literal["GET", "POST"] = "GET",
-    header: Dict[str, str] = request_header,
-    params: Union[Dict[str, Any], List[Tuple[str, Any]], None] = None,
-    _json: Optional[Dict[str, Any]] = None,
-    data: Optional[FormData] = None,
-) -> Union[Dict, int]:
-    global NOW_QUEUE
-    logger.info(f"[SayuStock] 请求: {url}")
-    logger.info(f"[SayuStock] Params: {params}")
-
-    if url.startswith(
-        (
-            "https://quote.eastmoney.com/center/api/sidemenu_new.json",
-            "https://quote.eastmoney.com/stockhotmap/api/getquotedata",
-            # "https://push2his.eastmoney.com",
-            "https://quotederivates.eastmoney.com",
-        )
-    ):
-        header = header_simple
-
-    base_header = dict(header)
-    base_header.pop("Cookie", None)
-    retry_cookie = ""
-
-    async with ClientSession(
-        connector=TCPConnector(verify_ssl=True),
-        headers=base_header,
-    ) as client:
-        final_url = str(URL(url).with_query(params or {}))
-        logger.info(f"[SayuStock] 最终请求URL：{final_url}")
-
-        while NOW_QUEUE >= 6:
-            await asyncio.sleep(random.uniform(0.4, 0.9))
-
-        for _ in range(2):
-            used_cookie = ""
-            try:
-                NOW_QUEUE += 1
-                request_headers = dict(base_header)
-                if retry_cookie:
-                    request_headers["Cookie"] = retry_cookie
-                elif _need_dc_token(url):
-                    cached_cookie = await get_dc_token()
-                    if cached_cookie:
-                        request_headers["Cookie"] = cached_cookie
-                used_cookie = request_headers.get("Cookie", "")
-                async with client.request(
-                    method,
-                    url=final_url,
-                    headers=request_headers,
-                    params=params,
-                    json=_json,
-                    data=data,
-                    timeout=ClientTimeout(total=300),
-                ) as resp:
-                    try:
-                        raw_data = await resp.json()
-                    except (ContentTypeError, json.decoder.JSONDecodeError):
-                        _raw_data = await resp.text()
-                        raw_data = -999
-                    logger.debug(raw_data)
-
-                    if resp.status != 200:
-                        logger.error(f"[SayuStock][EM] 访问 {url} 失败, 错误码: {resp.status}, 错误返回: {raw_data}")
-                        if resp.status == 403:
-                            raise ServerDisconnectedError("403 Forbidden")
-                        return -999
-                    return raw_data
-            except ServerDisconnectedError:
-                logger.warning(f"[SayuStock] 请求 {url} 失败, 尝试获取DC-Token...")
-                retry_cookie = await get_dc_token(force_refresh=True, current_token=used_cookie)
-                await asyncio.sleep(random.uniform(0.2, 0.9))
-            finally:
-                NOW_QUEUE -= 1
-        else:
-            return -400016
-
-
-async def get_dc_token(force_refresh: bool = False, current_token: str = ""):
-    global DC_TOKEN, DC_TOKEN_LOCK, LAST_DC_REFRESH, LAST_DC_FAILURE
-
-    if DC_TOKEN and not force_refresh:
-        return DC_TOKEN
-
-    if DC_TOKEN_LOCK is None:
-        DC_TOKEN_LOCK = asyncio.Lock()
-
-    # 如果 token 存在且不是强制刷新，直接返回
-    if DC_TOKEN and not force_refresh:
-        return DC_TOKEN
-
-    async with DC_TOKEN_LOCK:
-        # 双重检查
-        if DC_TOKEN and not force_refresh:
-            return DC_TOKEN
-
-        now = datetime.now()
-        if force_refresh and current_token and DC_TOKEN and DC_TOKEN != current_token:
-            logger.info("[SayuStock] DC-Token 已被其它协程刷新，复用新 Token。")
-            return DC_TOKEN
-
-        if not force_refresh:
-            persisted_token = await _load_persisted_dc_token()
-            if persisted_token:
-                DC_TOKEN = persisted_token
-                return DC_TOKEN
-
-        # 冷却检查：5分钟内不重复刷新
-        if not force_refresh and DC_TOKEN and (now - LAST_DC_REFRESH).total_seconds() < 300:
-            logger.info("[SayuStock] DC-Token 刷新冷却中，使用旧 Token。")
-            return DC_TOKEN
-
-        if force_refresh and DC_TOKEN and now - LAST_DC_REFRESH < DC_FORCE_REFRESH_COOLDOWN:
-            logger.info("[SayuStock] DC-Token 强制刷新冷却中，复用刚刷新的 Token。")
-            return DC_TOKEN
-
-        # 失败熔断：如果最近一次失败在 2 分钟内，不再尝试，避免阻塞
-        if (now - LAST_DC_FAILURE).total_seconds() < 120:
-            logger.warning("[SayuStock] DC-Token 最近刷新失败，熔断中，跳过浏览器启动。")
-            return DC_TOKEN
-
-        token = await _fetch_dc_token()
-        if token:
-            DC_TOKEN = token
-            LAST_DC_REFRESH = now
-        else:
-            LAST_DC_FAILURE = now
-            logger.error("[SayuStock] DC-Token 获取失败，进入 2 分钟熔断期。")
-        return DC_TOKEN
-
-
-async def _fetch_dc_token():
-    global DC_TOKEN
-    async with async_playwright() as p:
-        from ..image import launch_browser
-        try:
-            browser = await launch_browser(
-                p,
-                headless=True,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-        except Exception as e:
-            logger.error(f"[SayuStock] Chromium launch failed completely: {e}")
-            return ""
-
-        context = await browser.new_context(
-            user_agent=UA,
-            viewport={"width": 1366, "height": 768},
-        )
-        page = await context.new_page()
-
-        try:
-            await page.goto(
-                "https://www.eastmoney.com/",
-                wait_until="domcontentloaded",
-                timeout=15000,
-            )
-            await page.wait_for_timeout(1500)
-            cookies = await context.cookies()
-            logger.debug(f"[SayuStock] DC cookies fetched: {cookies}")
-            cl = [f"{cookie['name']}={cookie['value']}" for cookie in cookies]  # type: ignore # noqa: E501
-            DC_TOKEN = ";".join(cl)
-            expire_at = _get_cookie_expire(cookies)  # type: ignore[arg-type]
-            await _save_persisted_dc_token(DC_TOKEN, expire_at)
-            logger.debug(f"[SayuStock] DC cookie header set: {DC_TOKEN}")
-            return DC_TOKEN
-        except Exception as e:
-            logger.error(f"[SayuStock] Failed to fetch DC-Token: {e}")
-            return ""
-        finally:
-            await browser.close()
+async def stock_request(*args: Any, **kwargs: Any) -> Union[Dict[str, Any], int]:
+    """兼容旧导入路径的东方财富请求工厂。"""
+    return await EASTMONEY_REQUESTER.stock_request(*args, **kwargs)

@@ -7,6 +7,7 @@ class StockInfo(TypedDict):
     name: str
     industry_l1: str
     industry_l2: str
+    industry_l3: str
 
 
 chinese_stocks_path = Path(__file__).parent / "chinese_stocks.json"
@@ -32,17 +33,21 @@ PREFIX_DATA = {
     "153": "粉单",
     "119": "汇率",
     "155": "英股",
+    "177": "韩股",
     "2": "指数",
     "90": "板块",
     "122": "现货",
+    "109": "期货",
+    "100": "指数",
 }
 
 
 ErroText = {
-    "typemap": "❌未找到对应板块, 请重新输入\n📄例如: \n大盘云图沪深A\n大盘云图创业板 \n等等...",
+    "typemap": "❌未找到对应板块, 请重新输入\n📄例如:\n行业云图 水泥\n行业云图 建筑材料\n概念云图 人工智能",
     "notData": "❌不存在该板块或市场, 暂无数据...",
     "notStock": "❌不存在该股票，暂无数据...",
     "notOpen": "❌该股票未开盘，暂无数据...",
+    "notMarket": "❌请后跟股票代码使用, 例如：个股 证券ETF",
 }
 
 VIX_LIST = {
@@ -95,12 +100,20 @@ header_simple = {
     "sec-ch-ua-platform": '"Windows"',
 }
 
-DC_COOKIES = {}
+DC_COOKIES = {
+    "qgqp_b_id": "a4ad5101a1218975271d02d73aacf03a",
+    "st_nvi": "MaWBmK2ref7oCBA_DkWhW1ede",
+    "nid": "077407b960092c0310185ecdc5f8c00b",
+    "nid_create_time": "1756794328056",
+    "gvi": "HfIZExkHZlE5FTRjZeVKca89c",
+    "gvi_create_time": "1756794328056",
+}
 
 request_header = {
     "User-Agent": UA,
     "Accept": "*/*",
     "Accept-Language": AL,
+    "Cookie": "qgqp_b_id=229f77509a638e072d07e4bdd080365e; st_nvi=q3QPHkjC_LDf4RiYeIWUW54ac; st_si=06313790339453; st_asi=delete; nid18=00620625750c0d61de6dd27ce794c681; nid18_create_time=1776748551813; gviem=otwB4g1cC1zjYc6TqadlO5403; gviem_create_time=1776748551813; st_pvi=80092537355939; st_sp=2026-04-21%2013%3A15%3A51; st_inirUrl=https%3A%2F%2Fwww.eastmoney.com%2F; st_sn=2; st_psi=20260421131554736-113200301324-4658149161; fullscreengg=1; fullscreengg2=1",  # noqa: E501
     "Dnt": "1",
     # "Host": "push2his.eastmoney.com",
     "sec-ch-ua": '''"Chromium";v="142", "Google Chrome";v="142", "Not_A Brand";v="99"''',
@@ -118,19 +131,22 @@ trade_detail_dict = {
     # 'f15': '最高',
     # 'f16': '最低',
     # 'f17': '今开',
-    # 'f8': '换手率',
-    # 'f10': '量比',
-    # 'f9': '市盈率',
+    "f8": "换手率",
+    "f10": "量比",
+    "f9": "市盈率",
     # 'f5': '成交量',
     "f6": "成交额",
     # 'f18': '昨收',
     "f20": "总市值",
-    # 'f21': '流通市值',
+    "f21": "流通市值",
     # 'f13': '编号',
     "f100": "所属板块",
     # 'f124': '更新时间戳',
+    "f104": "上涨家数",
+    "f105": "下跌家数",
     "f128": "涨幅最多股票",
     "f136": "对应涨幅",
+    "f140": "领涨代码",
     "f207": "跌幅最多股票",
     "f222": "对应跌幅",
 }
@@ -151,7 +167,16 @@ SINGLE_LINE_FIELDS1 = [
     "f13",
 ]
 
-SINGLE_LINE_FIELDS2 = ["f51", "f52", "f53", "f54", "f55", "f56", "f57", "f58"]
+SINGLE_LINE_FIELDS2 = [
+    "f51",
+    "f52",
+    "f53",
+    "f54",
+    "f55",
+    "f56",
+    "f57",
+    "f58",
+]
 
 SINGLE_STOCK_FIELDS = [
     # 基本信息
@@ -178,8 +203,17 @@ SINGLE_STOCK_FIELDS = [
     "f261",
     # 成交量和成交额
     "f279",
-    "f277",
-    "f278",
+    # 公司核心数据（模拟盘财报评分用）
+    "f173",  # ROE
+    "f183",  # 总营收(元)
+    "f184",  # 总营收同比(%)
+    "f185",  # 净利润同比(%)
+    "f186",  # 毛利率(%)
+    "f187",  # 净利率(%)
+    "f188",  # 负债率(%)
+    "f190",  # 每股未分配利润(元)
+    # ATR / 振幅（波动率评分用）
+    "f275",  # 振幅
     "f288",
     # 开盘价、最高价、最低价、收盘价
     "f19",
@@ -375,6 +409,52 @@ code_id_dict = {
     "墨西哥指数": "100.MXX",
     "俄罗斯RTS": "100.RTS",
     "俄罗斯指数": "100.RTS",
+    # —— 补充以支持 「个股 kospi」/「个股 日经225」 等命令直接补齐代号 —— #
+    "kospi": "100.KS11",
+    "KOSPI": "100.KS11",
+    "kosdaq": "100.KOSDAQ",
+    "KOSDAQ": "100.KOSDAQ",
+    "n225": "100.N225",
+    "N225": "100.N225",
+    "日经": "100.N225",
+    "日经指数": "100.N225",
+    "日经225指数": "100.N225",
+    "恒生": "100.HSI",
+    "hsi": "100.HSI",
+    "HSI": "100.HSI",
+    "hsi指数": "100.HSI",
+    "恒生科技": "100.HSTECH",
+    "hstech": "100.HSTECH",
+    "ndx": "100.NDX",
+    "NDX": "100.NDX",
+    "djia": "100.DJIA",
+    "tsx": "100.TSX",
+    "TSX": "100.TSX",
+    "bvsp": "100.BVSP",
+    "BVSP": "100.BVSP",
+    "mxx": "100.MXX",
+    "MXX": "100.MXX",
+    "rts": "100.RTS",
+    "RTS": "100.RTS",
+    "sx5e": "100.SX5E",
+    "SX5E": "100.SX5E",
+    "sxxp": "100.SXXP",
+    "SXXP": "100.SXXP",
+    "斯托克600": "100.SXXP",
+    "欧洲斯托克600": "100.SXXP",
+    "ftse": "100.FTSE",
+    "FTSE": "100.FTSE",
+    "fchi": "100.FCHI",
+    "FCHI": "100.FCHI",
+    "gdaxi": "100.GDAXI",
+    "GDAXI": "100.GDAXI",
+}
+
+# 手动重定向：东财 suggest 按热度排序，scm 会命中美股 SCM、原油主连会命中布油 B00Y。
+# 键为精确输入（大小写不敏感），值为 (secid, 名称, 证券类型)，优先于联网搜索。
+code_query_overrides: dict[str, tuple[str, str, str]] = {
+    "scm": ("142.scm", "原油主连", "期货"),
+    "原油主连": ("142.scm", "原油主连", "期货"),
 }
 
 # 国际市场、
@@ -388,14 +468,16 @@ i_code = {
     "道琼斯": "i:100.DJIA",
     "标普500": "i:100.SPX",
     "罗素2000价值股ETF-iShares": "i:107.IWN",
-    "欧洲斯托克50": "i:100.SX5E",
+    "欧洲斯托克600": "i:100.SXXP",
     "英国富时100": "i:100.FTSE",
     "法国CAC40": "i:100.FCHI",
     "德国DAX30": "i:100.GDAXI",
+    # --- VPS 本地补充（AriaPhantom fork；上游无） ---
     "俄罗斯RTS": "i:100.RTS",
     "巴西BOVESPA": "i:100.BVSP",
     "澳洲标普200": "i:100.AS51",
     "印度SENSEX": "i:100.SENSEX",
+    "欧洲斯托克50": "i:100.SX5E",
 }
 
 
@@ -403,21 +485,24 @@ market_dict["国际市场"] = ",".join(i_code.values())
 
 # 大宗商品
 commodity = {
-    "伦敦金": "122.XAU",
-    "伦敦银": "122.XAG",
-    "伦敦铜": "109.LCPT",
+    "XAU": "122.XAU",
+    "XAG": "122.XAG",
+    "综合铜03": "109.LCPT",
+    "NYMEX原油": "102.CL00Y",
+    # '综合铝03': '109.LALT',
+    "螺纹钢主连": "113.rbm",
+    # '纸浆主连': '113.spm',
+    "豆粕主连": "114.mm",
+    "焦煤主连": "114.jmm",
+    # '综合铅03': '109.LLDT',
+    # '综合锌03': '109.LZNT',
+    "生猪主连": "114.lhm",
+    # --- VPS 本地补充（AriaPhantom fork；上游无） ---
     "COMEX黄金": "101.GC00Y",
     "COMEX白银": "101.SI00Y",
     "COMEX铜": "101.HG00Y",
-    "WTI原油": "102.CL00Y",
     "布伦特原油": "112.B00Y",
     "天然气": "102.NG00Y",
-    # '综合铝03': '109.LALT',
-    "COMEX铂金": "101.PL00Y",
-    "螺纹钢主连": "113.rbm",
-    "豆粕主连": "114.mm",
-    "焦煤主连": "114.jmm",
-    "生猪主连": "114.lhm",
 }
 
 # 债券市场
@@ -434,11 +519,8 @@ bond = {
     "美国10年期国债收益率": "171.US10Y",
     # '美国5年期国债收益率': '171.US5Y',
     "美国2年期国债收益率": "171.US2Y",
-    "日本30年期国债收益率": "",
-    "日本10年期国债收益率": "171.GJGB10",
-    "日本2年期国债收益率": "",
-    "德国10年期国债收益率": "171.GDBR10",
-    "英国10年期国债收益率": "171.GUKG10",
+    "JP 30Y": "171.JP30Y",
+    "JP 10Y": "171.JP10Y",
 }
 
 # b:MK0300 外汇
@@ -448,8 +530,21 @@ whsc = {
     # '美元兑港币': '119.USDHKD',
     "美元兑日元": "119.USDJPY",
     "美元指数": "100.UDI",
+    # '欧元兑美元': '119.EURUSD',
+    # '英镑兑美元': '119.GBPUSD',
+    # '澳元兑美元': '119.AUDUSD',
+    # '美元兑泰铢': '119.USDTHB',
+    # --- VPS 本地补充（AriaPhantom fork；上游无） ---
     "欧元兑美元": "119.EURUSD",
     "英镑兑美元": "119.GBPUSD",
     "澳元兑美元": "119.AUDUSD",
     "美元兑加元": "119.USDCAD",
+}
+
+# 加密货币（全天候底栏一排 4 格；勿用 CRYPTO_MAP 别名表当展示键）
+crypto = {
+    "BTC": "BTC",
+    "ETH": "ETH",
+    "SOL": "SOL",
+    "XRP": "XRP",
 }

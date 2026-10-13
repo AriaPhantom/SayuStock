@@ -1,5 +1,6 @@
 import json
-from typing import Any, Dict, Tuple, Union, Literal, Optional, cast
+import time
+from typing import Any, Dict, Tuple, Union, Literal, Optional
 
 from aiohttp import (
     FormData,
@@ -30,9 +31,12 @@ NEWS: XueQiu7x24 = {
     "next_id": 0,
 }
 XUEQIU_TOKEN = ""
+# 雪球 400016 后短退避，避免 5 分钟轮询和其它调用方连续打 token。
+_NEWS_BACKOFF_S = 90.0
+_news_backoff_until = 0.0
 
 
-async def get_token():
+async def get_token() -> object:
     global XUEQIU_TOKEN
     async with async_playwright() as p:
         # 启动浏览器（包含安装兜底）
@@ -51,12 +55,12 @@ async def get_token():
         page = await context.new_page()
 
         try:
-            # 导航到目标页面
-            await page.goto("https://xueqiu.com/", wait_until="networkidle", timeout=15000)
+            # 首页只下发 acw_tc，匿名 xq_a_token 改由 /hq 下发
+            await page.goto("https://xueqiu.com/hq", wait_until="networkidle", timeout=15000)
             # 获取所有 Cookie
             cookies = await context.cookies()
             logger.debug(f"[SayuStock] 获取Cookie: {cookies}")
-            cl = [f"{cookie['name']}={cookie['value']}" for cookie in cookies]  # type: ignore # noqa: E501
+            cl = [f"{cookie['name']}={cookie['value']}" for cookie in cookies if "name" in cookie and "value" in cookie]
             XUEQIU_TOKEN = ";".join(cl)
             _HEADER["Cookie"] = XUEQIU_TOKEN
             logger.debug(f"[SayuStock] 设置Cookie: {XUEQIU_TOKEN}")
@@ -65,13 +69,20 @@ async def get_token():
             await browser.close()
 
 
-async def clean_news():
-    global NEWS
-    NEWS = {
-        "next_max_id": 0,
-        "items": [],
-        "next_id": 0,
-    }
+# 新闻缓存保留时长。小时/交易时段/每日汇总推送需要取到隔夜消息，
+# 不能在 00:00 整表清空，只裁掉超过该时长的旧新闻，内存仍有界。
+# 取 48h 而非 24h：漏推一次「每日 08:00」时，下一次汇总仍要能补齐前一天的量。
+NEWS_RETENTION_MS = 48 * 60 * 60 * 1000
+
+# 逐条实时只需最新几页；cover_ms 回填时按覆盖窗口决定翻多少页，页数上限兜底
+_NEWS_LIVE_PAGES = 3
+_NEWS_MAX_PAGES = 60
+
+
+async def clean_news() -> None:
+    """按 created_at 裁剪新闻缓存中超过保留时长的旧条目"""
+    now_ms = int(time.time() * 1000)
+    NEWS["items"] = [i for i in NEWS["items"] if now_ms - i["created_at"] <= NEWS_RETENTION_MS]
 
 
 async def get_news_list(
@@ -84,22 +95,60 @@ async def get_news_list(
     data = await stock_request(NEWS_API, params=params)
     if isinstance(data, int):
         return data
-    data = cast(XueQiu7x24, data)
-    return data
+    # 显式按 TypedDict 结构取值：接口字段缺失时立即 KeyError，而非默默透传脏数据
+    return XueQiu7x24(
+        next_max_id=data["next_max_id"],
+        items=data["items"],
+        next_id=data["next_id"],
+    )
+
+
+def _cached_news() -> Optional[Tuple[int, XueQiu7x24]]:
+    if not NEWS["items"]:
+        return None
+    return max(item["id"] for item in NEWS["items"]), NEWS
 
 
 async def get_news(
     max_id: int = 0,
+    cover_ms: int = 0,
 ) -> Union[int, Tuple[int, XueQiu7x24]]:
-    global NEWS
+    """取雪球7x24新闻并合并进全局 NEWS 缓存。
+
+    cover_ms > 0 时持续翻页，直到缓存已覆盖该时长（汇总推送靠它回填隔夜/隔日区间，
+    进程重启后缓存是空的，否则只能拿到最近 45 条）；为 0 时只取最新 _NEWS_LIVE_PAGES 页。
+    """
+    global NEWS, _news_backoff_until
+    if time.monotonic() < _news_backoff_until:
+        cached = _cached_news()
+        if cached is not None:
+            logger.warning("[SayuStock] 雪球 400016 退避中，返回已缓存新闻")
+            return cached
+        return -400016
     _max_id = max_id
     return_max_id = max_id
+    # 用 seen_ids 防止同一新闻被反复 append 进全局 NEWS
+    seen_ids: set = {item["id"] for item in NEWS["items"]}
+    now_ms = int(time.time() * 1000)
 
-    for i in range(3):
+    cached_oldest = min((item["created_at"] for item in NEWS["items"]), default=now_ms)
+    need_cover = bool(cover_ms) and now_ms - cached_oldest < cover_ms
+    max_pages = _NEWS_MAX_PAGES if need_cover else _NEWS_LIVE_PAGES
+    oldest_ms: Optional[int] = None
+
+    for i in range(max_pages):
         data = await get_news_list(max_id=_max_id)
         if isinstance(data, int):
+            if data == -400016:
+                _news_backoff_until = time.monotonic() + _NEWS_BACKOFF_S
+                logger.warning("[SayuStock] 雪球 400016，90 秒内不再请求")
+                cached = _cached_news()
+                if cached is not None:
+                    return cached
             return data
-        data = cast(XueQiu7x24, data)
+
+        if not data["items"]:
+            break
 
         if i == 0:
             return_max_id = data["items"][0]["id"]
@@ -108,12 +157,20 @@ async def get_news(
             break
 
         for item in data["items"]:
-            if item["id"] >= max_id:
+            if item["id"] > max_id and item["id"] not in seen_ids:
                 NEWS["items"].append(item)
+                seen_ids.add(item["id"])
+
+        page_oldest = min(item["created_at"] for item in data["items"])
+        oldest_ms = page_oldest if oldest_ms is None else min(oldest_ms, page_oldest)
 
         NEWS["next_id"] = data["next_id"]
         NEWS["next_max_id"] = data["next_max_id"]
         _max_id = data["next_max_id"]
+
+        # 已经翻到比覆盖窗口更旧的条目就不必再翻
+        if need_cover and oldest_ms is not None and now_ms - oldest_ms >= cover_ms:
+            break
 
     return return_max_id, NEWS
 
