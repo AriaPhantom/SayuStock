@@ -155,9 +155,10 @@ class TencentMarketData(PartialMarketData):
             return symbol
         qt_sym = tencent_symbol_from_secid(symbol.provider_symbol)
         assert qt_sym is not None
-        spot = _spot_only(symbol, qt_sym, kind="分时")
-        if spot is not None:
-            return spot
+        # 2026-10-19 实测：_TENCENT_QUOTE_ONLY 里的港股指数(hkHSI 332 点)与
+        # fx* 外汇(fxEURUSD 1287 点)用 minute 接口都能拿到当日分时；
+        # 「仅有盘口」的假设对这些不成立，早退会让全天候的小图整体缺失。
+        # minute 没数据的标的由 parse/upper 层正常报错顺延。
         quote = await self.quote(query)
         payload = await fetch_minute(qt_sym)
         if isinstance(payload, str):
