@@ -37,17 +37,30 @@ class CompositeMarketData:
         crypto: MarketDataPort,
         vix: MarketDataPort,
         fund: MarketDataPort | None = None,
+        crypto_fallback: MarketDataPort | None = None,
     ) -> None:
         self._equity = equity
         self._crypto = crypto
         self._vix = vix
         self._fund = fund
+        # 加密现货兜底：OKX 不可用时直投新浪 fx_s*（绕过东财解析层）
+        self._crypto_fb = crypto_fallback
 
     def _route(self, query: str) -> MarketDataPort:
         if is_vix_query(query):
             return self._vix
         if is_crypto_query(query):
             return self._crypto
+        return self._equity
+
+    def _fallback_port(self, port: MarketDataPort) -> MarketDataPort:
+        """专用槽位（加密/VIX/基金）失败时的顺延目标。
+
+        加密现货给专用兜底源（新浪 fx_s*），股票仍走优先级链：
+        腾讯对这类 ticker 会搜索到 Grayscale 迷你 ETF（BTC.AM），不是现货价。
+        """
+        if port is self._crypto and self._crypto_fb is not None:
+            return self._crypto_fb
         return self._equity
 
     def _slot_provider(self, port: MarketDataPort) -> str | None:
@@ -71,11 +84,20 @@ class CompositeMarketData:
 
     async def resolve(self, query: str) -> SymbolRef | None:
         port = await self._kline_port(query)
-        return await port.resolve(query)
+        out = await port.resolve(query)
+        if out is None and port is not self._equity:
+            out = await self._fallback_port(port).resolve(query)
+        return out
 
     async def quote(self, query: str) -> Quote | MarketError:
         port = await self._kline_port(query)
         result = await port.quote(query)
+        if is_market_error(result) and port is not self._equity:
+            # 专用源失败（如 OKX 在机房 IP 直连超时）→ 顺延兜底源
+            fallback = await self._fallback_port(port).quote(query)
+            if not is_market_error(fallback):
+                return fallback
+            return result
         pid = self._slot_provider(port)
         if pid is not None and not is_market_error(result):
             result = stamp_provider(result, pid)
@@ -87,6 +109,11 @@ class CompositeMarketData:
     async def intraday(self, query: str, *, ndays: int = 1) -> IntradaySeries | MarketError:
         port = self._route(query)
         result = await port.intraday(query, ndays=ndays)
+        if is_market_error(result) and port is not self._equity:
+            fallback = await self._fallback_port(port).intraday(query, ndays=ndays)
+            if not is_market_error(fallback):
+                return fallback
+            return result
         pid = self._slot_provider(port)
         if pid is not None and not is_market_error(result):
             result = stamp_provider(result, pid)
@@ -102,6 +129,11 @@ class CompositeMarketData:
     ) -> KlineSeries | MarketError:
         port = await self._kline_port(query)
         series = await port.kline(query, period, start=start, end=end)
+        if is_market_error(series) and port is not self._equity:
+            # 专用源失败 → 顺延兜底源
+            fb = await self._fallback_port(port).kline(query, period, start=start, end=end)
+            if not is_market_error(fb):
+                return fb
         if (
             port is self._equity
             and self._fund is not None

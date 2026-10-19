@@ -546,7 +546,7 @@ whsc = {
 # 加密货币（全天候底栏一排 4 格；勿用 CRYPTO_MAP 别名表当展示键）
 crypto = {
     "BTC": "BTC",
-    "ETH": "ETH",
-    "SOL": "SOL",
     "XRP": "XRP",
+    # ETH/SOL：腾讯 fx_s 搜不到现货（会误配 Grayscale 迷你 ETF，ETH 显示 22.98
+    # 即该 ETF 而非现货价），OKX 与新浪 fx_s 又都无此对 → 格子宁缺毋滥，暂以下架。
 }
