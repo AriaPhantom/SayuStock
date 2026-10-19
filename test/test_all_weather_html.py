@@ -124,11 +124,15 @@ def test_canvas_grows_when_section_has_spark() -> None:
 
 
 def test_crypto_section_stays_four_unique() -> None:
+    """加密表按用户口径保留 BTC/XRP（ETH/SOL 三家均无正确现货，已摘除）。
+
+    测试跟随表驱动：无源/映射变化的审核点在 constant.py 的变更说明，不在这里。
+    """
     items = [_item(n) for n in crypto]
     html = build_all_weather_html([("加密货币", items)])
-    for name in ("BTC", "ETH", "SOL", "XRP"):
+    for name in crypto:
         assert name in html
-    assert html.count('class="tile') == 4
+    assert html.count('class="tile') == len(crypto)
 
 
 def test_long_names_are_shortened() -> None:

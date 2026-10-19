@@ -15,7 +15,7 @@ from ..utils.market import (
     board_rows_to_items,
 )
 from ..utils.constant import bond, whsc, crypto, i_code, commodity
-from ..utils.sparkline import sparkline_from_series
+from ..utils.sparkline import sparkline_from_series, build_sparkline_svg
 from ..utils.all_weather_html import (
     SPARK_H,
     SPARK_W,
@@ -97,6 +97,51 @@ async def _get_items(_d: dict[str, str], sparks: SparkMap | None = None) -> Item
     return result
 
 
+_US_DAILY_SPARK: dict[str, str] = {
+    "100.DJIA": ".dji",
+    "100.SPX": ".inx",
+    "100.NDX": ".ixic",
+}
+
+
+async def _daily_spark(secid: str) -> str | None:
+    """分时不可用时的日K兜底：近 40 个交易日收盘折线（新浪美股日K / 腾讯港股日K）。"""
+    from ..utils.market.adapters.sina.client import fetch_us_daily
+    from ..utils.market.adapters.tencent.client import fetch_fqkline
+    from ..utils.market.adapters.tencent.parse import tencent_symbol_from_secid
+
+    closes: list[float] = []
+    us_sym = _US_DAILY_SPARK.get(secid)
+    if us_sym:
+        # 新浪美股日K（.dji/.inx/.ixic 数据是活的；它们的 1 分钟线停更于 2020）
+        rows = await fetch_us_daily(us_sym)
+        if isinstance(rows, list) and rows:
+            closes = [float(r["c"]) for r in rows if isinstance(r, dict) and r.get("c")][-40:]
+    if len(closes) < 2:
+        sym = tencent_symbol_from_secid(secid)
+        if sym:
+            d = await fetch_fqkline(sym, "day", 40)
+            rows: list = []
+            if isinstance(d, dict):
+                data = d.get("data") or {}
+                cd = (data.get(sym) or {}) if isinstance(data, dict) else {}
+                rows = cd.get("qfqday") or cd.get("day") or []
+            for r in rows:
+                try:
+                    closes.append(float(r[2]))  # 收盘价
+                except (TypeError, ValueError, IndexError):
+                    continue
+    if len(closes) < 2:
+        return None
+    return build_sparkline_svg(
+        closes,
+        closes[0],
+        up=closes[-1] >= closes[0],
+        width=SPARK_W,
+        height=SPARK_H,
+    )
+
+
 async def _fetch_sparks(
     table: dict[str, str],
     sparks: SparkMap,
@@ -111,6 +156,13 @@ async def _fetch_sparks(
             return
         series = await get_market().intraday(secid)
         if is_market_error(series):
+            # 分时源缺失（东财 trends2 / push2 被机房 IP 掐、新浪 b_* 只有盘口）
+            # → 日K兜底：改画近 40 个交易日收盘折线
+            svg = await _daily_spark(secid)
+            if svg:
+                sparks[name] = svg
+                sparks[code] = svg
+                sparks[secid] = svg
             return
         sources.append(series.provider)
         svg = sparkline_from_series(series, width=SPARK_W, height=SPARK_H)

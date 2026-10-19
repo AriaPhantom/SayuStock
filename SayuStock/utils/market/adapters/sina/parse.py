@@ -91,11 +91,14 @@ _SINA_QUOTE_ONLY: dict[str, str] = {
     "119.AUDUSD": "fx_saudusd",
     "119.USDCAD": "fx_susdcad",
     # 加密：OKX 从 VPS 直连超时，改投新浪
+    "115.CFM": "nf_CF0",     # 棉花主连
+    "115.SAM": "nf_SA0",     # 纯碱主连
+    "115.FGM": "nf_FG0",     # 玻璃主连
     "BTC": "fx_sbtcusd",
     "XRP": "fx_sxrpusd",
 }
 # 商品连续：名称在首列。三十债 nf_TL0 不在这里。
-_SINA_DOMESTIC_NF = frozenset({"nf_RB0", "nf_M0", "nf_JM0", "nf_LH0"})
+_SINA_DOMESTIC_NF = frozenset({"nf_RB0", "nf_M0", "nf_JM0", "nf_LH0", "nf_CF0", "nf_SA0", "nf_FG0"})
 
 
 def sina_quote_only(secid: str) -> bool:
