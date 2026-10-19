@@ -45,38 +45,55 @@ async def __get_item(
     display_name: str,
     sparks: SparkMap | None,
 ) -> None:
-    await asyncio.sleep(random.uniform(0.2, 1))
-    if sparks is None:
-        item = await _quote_item(stock, display_name)
-        if item is not None:
-            result[item.name] = item
-        return
-    series = await get_market().intraday(stock)
-    if is_market_error(series) or series.quote is None:
-        # 外盘多数源只有盘口。分时失败仍留报价格，只是没有折线。
-        item = await _quote_item(stock, display_name)
-        if item is not None:
-            result[item.name] = item
-        return
-    q = series.quote
-    item = from_quote(q)
-    # 链上盖的是序列的 sourceBy，嵌套 quote 可能还是空的。
-    if item.provider is None and series.provider:
-        item = replace(item, provider=series.provider)
-    # 全天候格子按配置表的键展示/对齐；API 名可能是「黄金/美元」对不上 XAU
-    if display_name and display_name != item.name:
-        item = replace(item, name=display_name)
-    result[item.name] = item
-    svg = sparkline_from_series(series, width=SPARK_W, height=SPARK_H)
-    if svg:
-        sparks[item.name] = svg
-        sparks[stock] = svg
+    """单只标的取数；失败只丢该格，不影响同组其它标的。"""
+    try:
+        await asyncio.sleep(random.uniform(0.2, 1))
+        if sparks is None:
+            item = await _quote_item(stock, display_name)
+            if item is not None:
+                result[item.name] = item
+            return
+        series = await get_market().intraday(stock)
+        if is_market_error(series) or series.quote is None:
+            # 外盘多数源只有盘口。分时失败仍留报价格，只是没有折线。
+            item = await _quote_item(stock, display_name)
+            if item is not None:
+                result[item.name] = item
+            return
+        q = series.quote
+        item = from_quote(q)
+        # 链上盖的是序列的 sourceBy，嵌套 quote 可能还是空的。
+        if item.provider is None and series.provider:
+            item = replace(item, provider=series.provider)
+        # 全天候格子按配置表的键展示/对齐；API 名可能是「黄金/美元」对不上 XAU
+        if display_name and display_name != item.name:
+            item = replace(item, name=display_name)
+        result[item.name] = item
+        svg = sparkline_from_series(series, width=SPARK_W, height=SPARK_H)
+        if svg:
+            sparks[item.name] = svg
+            sparks[stock] = svg
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            f"[SayuStock][行情API] {display_name or stock} 取数异常，跳过该格: "
+            f"{type(exc).__name__} {exc}"
+        )
 
 
 async def _get_items(_d: dict[str, str], sparks: SparkMap | None = None) -> ItemMap:
+    """逐标的取数；一只抛异常不该带走同组其它标的。
+
+    此前 ``gather`` 未带 ``return_exceptions=True``：加密货币里 ETH/SOL 试
+    直连 OKX 超时抛异常，把 BTC/XRP 也一起吞了，表现为「加密货币整节消失」。
+    """
     result: ItemMap = {}
     tasks = [__get_item(result, code, name, sparks) for name, code in _d.items() if code]
-    await asyncio.gather(*tasks)
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    for outcome in outcomes:
+        if isinstance(outcome, BaseException):
+            logger.warning(f"[SayuStock][行情API] 单只标的取数失败，已跳过该格: {outcome!r}")
     return result
 
 

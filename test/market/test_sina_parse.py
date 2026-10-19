@@ -125,8 +125,26 @@ def test_sina_symbol_from_secid_maps_bse_to_bj_prefix() -> None:
     assert sina_symbol_from_secid("119.USDJPY") == "fx_susdjpy"
     assert sina_symbol_from_secid("119.USDCHF") == "fx_susdchf"
     assert sina_symbol_from_secid("100.UDI") == "DINIW"
-    assert sina_symbol_from_secid("100.KOSPI200") is None
-    assert sina_symbol_from_secid("100.SXXP") is None
+    # 2026-10-19 实测：这批此前断言 None 的全球指数/商品/外汇，新浪其实都有，逐个实测后接入
+    assert sina_symbol_from_secid("100.KOSPI200") == "b_KOSPI2"
+    assert sina_symbol_from_secid("100.SXXP") == "b_SXXP"
+    assert sina_symbol_from_secid("100.SX5E") == "b_SX5E"
+    assert sina_symbol_from_secid("100.AS51") == "b_AS51"
+    assert sina_symbol_from_secid("100.SENSEX") == "b_SENSEX"
+    assert sina_symbol_from_secid("100.BVSP") == "b_IBOV"
+    assert sina_symbol_from_secid("101.GC00Y") == "hf_GC"
+    assert sina_symbol_from_secid("101.SI00Y") == "hf_SI"
+    assert sina_symbol_from_secid("101.HG00Y") == "hf_HG"
+    assert sina_symbol_from_secid("112.B00Y") == "hf_OIL"
+    assert sina_symbol_from_secid("102.NG00Y") == "hf_NG"
+    assert sina_symbol_from_secid("119.EURUSD") == "fx_seurusd"
+    assert sina_symbol_from_secid("119.GBPUSD") == "fx_sgbpusd"
+    assert sina_symbol_from_secid("119.AUDUSD") == "fx_saudusd"
+    assert sina_symbol_from_secid("119.USDCAD") == "fx_susdcad"
+    assert sina_symbol_from_secid("BTC") == "fx_sbtcusd"
+    assert sina_symbol_from_secid("XRP") == "fx_sxrpusd"
+    # 俄罗斯 RTS 与国债收益率（171.*）两家仍没有公开接口
+    assert sina_symbol_from_secid("100.RTS") is None
     assert sina_symbol_from_secid("171.CN10Y") is None
     assert sina_quote_only("122.XAU")
     assert not sina_quote_only("100.SPX")

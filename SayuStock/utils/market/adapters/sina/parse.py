@@ -74,6 +74,25 @@ _SINA_QUOTE_ONLY: dict[str, str] = {
     "119.USDCHF": "fx_susdchf",
     "119.USDJPY": "fx_susdjpy",
     "100.UDI": "DINIW",
+    # 2026-10-19：东财 push2 单标的报价在机房 IP 被掐，改投新浪。逐个实测。
+    "100.SXXP": "b_SXXP",     # 道琼斯斯托克600
+    "100.SX5E": "b_SX5E",     # 欧洲斯托克50
+    "100.AS51": "b_AS51",     # 澳洲标普200
+    "100.SENSEX": "b_SENSEX", # 印度SENSEX
+    "100.BVSP": "b_IBOV",     # 巴西BOVESPA（新浪没有 b_BVSP）
+    "100.KOSPI200": "b_KOSPI2",  # 新浪符号是 b_KOSPI2
+    "101.GC00Y": "hf_GC",
+    "101.SI00Y": "hf_SI",
+    "101.HG00Y": "hf_HG",
+    "112.B00Y": "hf_OIL",
+    "102.NG00Y": "hf_NG",
+    "119.EURUSD": "fx_seurusd",
+    "119.GBPUSD": "fx_sgbpusd",
+    "119.AUDUSD": "fx_saudusd",
+    "119.USDCAD": "fx_susdcad",
+    # 加密：OKX 从 VPS 直连超时，改投新浪
+    "BTC": "fx_sbtcusd",
+    "XRP": "fx_sxrpusd",
 }
 # 商品连续：名称在首列。三十债 nf_TL0 不在这里。
 _SINA_DOMESTIC_NF = frozenset({"nf_RB0", "nf_M0", "nf_JM0", "nf_LH0"})
@@ -375,25 +394,38 @@ def parse_hq_line_world(line: str, *, symbol: SymbolRef) -> Quote | MarketError:
     第 4、5 列可能是过期标签，日期以第 6 列为准。
     """
     parts = line.split(",")
-    if len(parts) < 12:
+    if len(parts) < 4:
         return parse_error("新浪全球指数盘口字段不足", provider=PROVIDER)
     price = _f(parts, 1)
-    prev_close = _f(parts, 9)
-    open_px = _f(parts, 8)
+    name = _s(parts, 0) or symbol.name
+    if len(parts) >= 12:
+        # 全量行：0 名称, 1 现价, 6 行情日期, 7 时间, 8 开, 9 昨收, 10 高, 11 低。
+        prev_close = _f(parts, 9)
+        open_px = _f(parts, 8)
+        high = _f(parts, 10)
+        low = _f(parts, 11)
+        as_of = _clock(_s(parts, 6), _s(parts, 7))
+    else:
+        # 精简行（b_SXXP / b_KOSPI2 等）：0 名称, 1 现价, 2 涨跌点数, 3 涨跌%。
+        # 没有开/高/低，用点数变动反推昨收，涨跌幅照常可算。
+        chg = _f(parts, 2)
+        prev_close = (price - chg) if (price is not None and chg is not None) else None
+        open_px = high = low = None
+        as_of = None
     if price is None or price <= 0:
         price = prev_close or open_px
     if price is None or price <= 0:
         return empty_error("新浪全球指数盘口无有效报价", provider=PROVIDER)
     return _quote_from_ohlc(
         symbol,
-        name=_s(parts, 0) or symbol.name,
+        name=name,
         price=price,
         open_px=open_px,
-        high=_f(parts, 10),
-        low=_f(parts, 11),
+        high=high,
+        low=low,
         prev_close=prev_close,
         volume=None,
-        as_of=_clock(_s(parts, 6), _s(parts, 7)),
+        as_of=as_of,
     )
 
 

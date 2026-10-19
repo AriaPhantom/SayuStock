@@ -108,7 +108,7 @@ def test_intl_tiles_get_spark_from_secid() -> None:
         now=datetime(2026, 8, 24, 10, 0),
         sparklines=sparks,
     )
-    assert html.count('class="spark"') == 12
+    assert html.count('class="spark"') == len(i_code)
     assert "sec has-spark" in html
     assert em_secid("i:1.000001") == "1.000001"
     assert em_secid("100.HSI") == "100.HSI"

@@ -16,7 +16,7 @@ _FOOTER_PATH = Path(__file__).resolve().parent / "texture2d" / "footer.png"
 
 # 全 HTML 排版，高度随分区行数 / 是否有分时变
 CSS_WIDTH = 1000
-_HEAD_H = 420
+_HEAD_H = 192
 _SEC_HEAD_H = 44
 _TILE_H = 132
 _TILE_H_SPARK = 176
@@ -100,7 +100,7 @@ _SEC_COLOR: dict[str, str] = {
     "加密货币": "rgb(122,64,42)",
 }
 _SEC_COLOR_FALLBACK = "rgb(75,85,104)"
-_TRACK_H = 44
+_TRACK_H = 16
 _TRACK_COUNT = 7
 _PLOT_H = _TRACK_H * _TRACK_COUNT
 _AXIS_START_MIN = 8 * 60
@@ -355,7 +355,7 @@ def _timeline_html(now: datetime) -> str:
                 if right < left:
                     right += 100.0
                 width = max(0.8, right - left)
-            glow = f"box-shadow:0 0 10px {color},0 0 3px #ffffff;border:1px solid #ffffff;" if live else "opacity:0.22;"
+            glow = f"box-shadow:none;border:1px solid #ffffff;" if live else "opacity:0.22;"
             bars.append(
                 f'<div class="tbar" style="left:{left:.2f}%;width:{width:.2f}%;background:{color};{glow}"></div>'
             )
@@ -436,49 +436,54 @@ body {{
   flex-direction: column;
   overflow: hidden;
 }}
+.titlerow {{ display: flex; align-items: baseline; gap: 10px; height: 26px; margin-bottom: 4px; }}
+.titlerow .t-cn {{ font-size: 18px; font-weight: 700; color: #ffffff; letter-spacing: 1px; }}
+.titlerow .t-en {{ font-size: 10px; font-weight: 600; letter-spacing: 2px; color: #8b95a8; }}
+.titlerow .t-time {{ font-family: monospace; font-size: 11px; color: #fde68a; }}
 .head {{
   flex: none;
   height: {_HEAD_H}px;
-  padding: 36px 70px 8px;
+  padding: 14px 62px 0;
+  overflow: hidden;
 }}
 .topbar {{ display: flex; height: 8px; border-radius: 8px; overflow: hidden; }}
 .top-l {{ flex: 1; background: #8b3a42; }}
 .top-r {{ flex: 1; background: #2a6a6a; }}
-.gantt {{ margin-top: 14px; display: flex; align-items: flex-start; }}
-.tcol {{ width: 40px; flex: none; padding-top: 16px; }}
+.gantt {{ margin-top: 6px; display: flex; align-items: flex-start; }}
+.tcol {{ width: 40px; flex: none; padding-top: 6px; }}
 .tname {{
-  height: {_TRACK_H}px; font-size: 14px; font-weight: 630; line-height: {_TRACK_H}px;
+  height: {_TRACK_H}px; font-size: 11px; font-weight: 630; line-height: {_TRACK_H}px;
 }}
-.tname.on {{ text-shadow: 0 0 8px currentColor; }}
+.tname.on {{ font-weight: 700; }}
 .tname.off {{ color: #4b5568; font-weight: 400; }}
-.tplot {{ flex: 1; position: relative; padding-top: 16px; }}
+.tplot {{ flex: 1; position: relative; padding-top: 6px; }}
 .vline {{
-  position: absolute; top: 16px; height: {_PLOT_H}px; width: 1px;
+  position: absolute; top: 6px; height: {_PLOT_H}px; width: 1px;
   border-left: 1px dashed #3a4258;
 }}
 .track {{ position: relative; height: {_TRACK_H}px; }}
 .tbar {{
-  position: absolute; top: {(_TRACK_H - 12) // 2}px; height: 12px; border-radius: 6px;
+  position: absolute; top: {(_TRACK_H - 6) // 2}px; height: 6px; border-radius: 3px;
   box-sizing: border-box;
 }}
 .track.on .tbar {{
-  height: 16px; top: {(_TRACK_H - 16) // 2}px;
+  height: 10px; top: {(_TRACK_H - 10) // 2}px;
 }}
 .now-line {{
-  position: absolute; top: 2px; height: {14 + _PLOT_H}px; width: 2px;
+  position: absolute; top: 1px; height: {11 + _PLOT_H}px; width: 1px;
   background: #fde68a; z-index: 3;
 }}
 .now-dot {{
   position: absolute; left: -4px; top: 0;
-  width: 10px; height: 10px; border-radius: 5px; background: #fde68a;
+  width: 6px; height: 6px; border-radius: 3px; background: #fde68a; left: -3px;
 }}
 .now-cap {{
   position: absolute; left: 8px; top: -1px;
-  font-size: 12px; font-weight: 630; color: #fde68a; white-space: nowrap;
+  font-size: 10px; font-weight: 630; color: #fde68a; white-space: nowrap;
 }}
-.ticks {{ position: relative; height: 22px; margin-top: 4px; }}
+.ticks {{ position: relative; height: 12px; margin-top: 2px; }}
 .tick {{
-  position: absolute; top: 0; font-size: 12px; color: #8b95a8; font-weight: 400; white-space: nowrap;
+  position: absolute; top: 0; font-size: 10px; color: #8b95a8; font-weight: 400; white-space: nowrap;
 }}
 .body {{ flex: none; padding: 0 62px; }}
 .sec-title {{
@@ -540,7 +545,7 @@ body {{
 <body>
 <div class="page">
   <!-- as_of:{_e(stamp)} -->
-  <div class="head">{_timeline_html(as_of)}</div>
+  <div class="head"><div class="titlerow"><span class="t-cn">全天候</span><span class="t-en">GLOBAL MARKET DESK</span><span class="t-time">{stamp} CST · 北京时间</span></div>{_timeline_html(as_of)}</div>
   <div class="body">{inner}</div>
   <div class="src">{source_text}</div>
   <img class="footer" src="{footer_uri}" width="850" height="40" />

@@ -28,6 +28,17 @@ _TENCENT_QUOTE_ONLY: dict[str, str] = {
     "109.LCPT": "hf_CAD",
     "119.USDJPY": "fxUSDJPY",
     "119.USDCHF": "fxUSDCHF",
+    # 2026-10-19：东财 push2 单标的报价在机房 IP 被掐，改投腾讯。
+    # 逐个实测（qt.gtimg.cn），符号与东财 secid 不同名。
+    "101.GC00Y": "hf_GC",     # COMEX 黄金
+    "101.SI00Y": "hf_SI",     # COMEX 白银
+    "101.HG00Y": "hf_HG",     # COMEX 铜
+    "112.B00Y": "hf_OIL",     # 布伦特原油
+    "102.NG00Y": "hf_NG",     # 美国天然气
+    "119.EURUSD": "fxEURUSD",
+    "119.GBPUSD": "fxGBPUSD",
+    "119.AUDUSD": "fxAUDUSD",
+    "119.USDCAD": "fxUSDCAD",
 }
 
 
